@@ -75,7 +75,7 @@ randomForest · glmnet · xgboost · infotheo · igraph · kableExtra
 
 ## Publicación
 
-[Ver documento en RPubs](#) <!-- reemplazar con URL final -->
+[Ver documento en RPubs](#) <https://rpubs.com/Alej5ndro/SVM-clasificacion>
 
 ---
 

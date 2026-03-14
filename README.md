@@ -75,9 +75,9 @@ randomForest · glmnet · xgboost · infotheo · igraph · kableExtra
 
 ## Publicación
 
-[Ver documento en RPubs](#) 
-<https://rpubs.com/Alej5ndro/SVM-clasificacion>
+[Ver documento en RPubs](#) <!-- reemplazar con URL final -->
 
 ---
 
-*Alejandro Figueroa Rojas · Ingeniero Comercial — Data & Business Intelligence*
+*Alejandro Figueroa Rojas · Ingeniero Comercial — Data & Business Intelligence*  
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-alejandrofigueroarojas-0077B5?style=flat&logo=linkedin)](https://www.linkedin.com/in/alejandrofigueroarojas)

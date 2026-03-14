@@ -1,0 +1,2017 @@
+---
+title: "Support Vector Machines aplicado a Customer Churn"
+subtitle: "Clasificación, Selección de Características y Puesta en Operación"
+author: "Alejandro Figueroa Rojas | Ingeniero Comercial — Data & Business Intelligence"
+date: today
+lang: es
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 4
+    toc-title: "Contenidos"
+    toc-location: left
+    number-sections: true
+    highlight-style: kate
+    fig-align: center
+    fig-width: 9
+    fig-height: 6
+    embed-resources: true
+    smooth-scroll: true
+    page-layout: full
+execute:
+  warning: false
+  message: false
+  echo: true
+  cache: false
+---
+
+```{=html}
+
+<style>
+body { font-family: 'Georgia', serif; font-size: 15px; line-height: 1.75; }
+h1, h2, h3, h4 { font-family: 'Helvetica Neue', sans-serif; color: #2c3e50; }
+.callout-note      { border-left: 4px solid #3498db; }
+.callout-tip       { border-left: 4px solid #2ecc71; }
+.callout-important { border-left: 4px solid #e74c3c; }
+blockquote { background: #f8f9fa; border-left: 4px solid #6c757d;
+             padding: 0.8em 1.2em; font-style: italic; }
+</style>
+```
+
+---
+
+# Contexto Histórico
+
+Las SVM tienen sus raíces en la **teoría de aprendizaje estadístico** (*VC theory*), desarrollada por Vladimir Vapnik y Alexey Chervonenkis durante los años 60 y 70:
+
+> Cortes, C., & Vapnik, V. (1995). Support-vector networks. *Machine Learning*, *20*(3), 273–297.
+
+# Motivación {.unnumbered}
+
+> *"La matemática no miente. Lo que miente son las estadísticas mal interpretadas."*  
+> — Fausto Preysler
+
+La retención de clientes en banca no es un problema de intuición — es un problema de señal. Detrás de cada cliente que abandona existe una estructura compleja: comportamiento financiero, historial de quejas, nivel de compromiso y perfil demográfico, actuando de forma conjunta y no lineal.
+
+Este documento aplica **Support Vector Machines (SVM)** con kernel RBF al problema de clasificación de churn bancario, siguiendo el pipeline formal: **EDA → Encoding → Clean Algorithm → Normalización MinMax → Selección de Características → SVM → Evaluación → Operación**. Cada decisión tiene justificación matemática y metodológica explícita.
+
+Como Ingeniero Comercial en constante formación en ciencia de datos, este trabajo 
+representa mi compromiso con construir modelos que no solo predicen, sino que 
+explican, se justifican y generan valor accionable para cualquier organización que 
+requiera tomar decisiones basadas en datos.
+
+
+**Fases del pipeline:**
+
+| Fase | Pasos | Descripción |
+|------|-------|-------------|
+| 1 — Datos | 1–3 | Extracción, variables, detección NA |
+| 2 — Preprocesamiento | 4–8 | EDA, encoding, Split, Clean, Normalización MinMax |
+| 3 — Selección variables | 9–10 | Fisher J / SFS / B&B / RF / Lasso / XGB / MI con k_comun |
+| 4 — Modelamiento | 11–13 | SVM RBF, Grid Search, validación cruzada |
+| 5 — Evaluación | 14–16 | Predicciones, métricas, curvas ROC y PR |
+| 6 — Operación | 17–19 | Datos nuevos, segmentación riesgo |
+
+---
+
+```{r setup, echo=FALSE}
+
+knitr::opts_chunk$set(comment="", message=FALSE, warning=FALSE,
+                      fig.align="center", fig.width=10, fig.height=6)
+```
+
+# Librerías y configuración
+
+```{r libraries}
+
+library(tidyverse); library(e1071);     library(caret)
+library(pROC);      library(ROCR);      library(GGally)
+library(corrplot);  library(gridExtra); library(scales)
+library(kableExtra);library(igraph);    library(randomForest)
+library(glmnet);    library(xgboost);   library(infotheo)
+
+select <- dplyr::select; filter <- dplyr::filter; mutate <- dplyr::mutate
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(plot.title    = element_text(face="bold", size=13, hjust=0.5),
+          plot.subtitle = element_text(color="grey45", hjust=0.5),
+          strip.text    = element_text(face="bold"))
+)
+
+PAL2 <- c("0"="#3498db", "1"="#e74c3c")
+set.seed(42)
+```
+
+---
+
+# Fase 1: Datos
+
+## Carga del dataset
+
+```{r load-data}
+
+churn <- read.csv("CustomerChurnRecords.csv", stringsAsFactors=FALSE)
+
+names(churn) <- names(churn) |>
+  stringr::str_to_lower() |>
+  stringr::str_replace_all("[\\s\\.]+", "_")
+
+canon <- c(satisfaction.score="satisfaction_score", point.earned="point_earned",
+           card.type="card_type")
+for (old in names(canon)) {
+  if (old %in% names(churn)) names(churn)[names(churn)==old] <- canon[[old]]
+}
+
+NUM_COLS <- c("creditscore","age","tenure","balance","numofproducts",
+              "estimatedsalary","satisfaction_score","point_earned")
+
+cat(sprintf("Dataset: %d × %d\nColumnas: %s\n",
+            nrow(churn), ncol(churn), paste(names(churn), collapse=", ")))
+```
+
+## Diccionario de variables
+
+| Variable | Tipo | Descripción |
+|---|---|---|
+| `creditscore` | Numérica | Score crediticio |
+| `geography` | Categórica | País del cliente |
+| `gender` | Categórica | Género |
+| `age` | Numérica | Edad en años |
+| `tenure` | Numérica | Años como cliente |
+| `balance` | Numérica | Saldo en cuenta |
+| `numofproducts` | Numérica | Productos contratados |
+| `hascreditcard` | Binaria | ¿Tiene tarjeta de crédito? |
+| `isactivemember` | Binaria | ¿Miembro activo? |
+| `estimatedsalary` | Numérica | Salario estimado |
+| `exited` | Binaria | **Objetivo**: 1 = churn |
+| `complain` | Binaria | ¿Ha realizado queja? |
+| `satisfaction_score` | Ordinal | Satisfacción 1–5 |
+| `card_type` | Categórica | Tipo de tarjeta |
+| `point_earned` | Numérica | Puntos acumulados |
+
+: Diccionario de variables {tbl-colwidths="[20,15,65]"}
+
+## Valores faltantes
+
+```{r missing}
+
+n_na <- sum(is.na(churn))
+if (n_na==0) cat("✔ Sin valores faltantes.") else cat(sprintf("⚠ %d NAs.", n_na))
+```
+
+---
+
+# Fase 2: Preprocesamiento
+
+## EDA
+
+```{r target-dist}
+
+prop_tbl <- count(churn, exited) |>
+  mutate(pct=n/sum(n), label=paste0(exited,"\n(",percent(pct,0.1),")"))
+
+ggplot(prop_tbl, aes(factor(exited), n, fill=factor(exited))) +
+  geom_col(width=0.55, color="white", linewidth=0.8) +
+  geom_text(aes(label=label), vjust=-0.4, fontface="bold", size=4.5) +
+  scale_fill_manual(values=PAL2, guide="none") +
+  scale_y_continuous(labels=comma, expand=expansion(mult=c(0,0.12))) +
+  annotate("text", x=1.5, y=max(prop_tbl$n)*0.92,
+           label=paste("Ratio churn:", round(prop_tbl$pct[prop_tbl$exited==1],3)),
+           color="#e74c3c", fontface="bold", size=4) +
+  labs(title="Distribución Variable Objetivo", subtitle="0=Retenido | 1=Churn",
+       x="Exited", y="Frecuencia")
+```
+
+::: {.callout-important}
+**Desbalance ~20% churn.** `createDataPartition` preserva esta proporción en Train y Test (split estratificado). Métricas primarias: AUC-ROC y F1-Score.
+:::
+
+```{r dist-plots, fig.height=10}
+
+num_eda <- intersect(NUM_COLS, names(churn))
+map(num_eda, \(v)
+  ggplot(churn |> select(all_of(c(num_eda,"exited"))),
+         aes(.data[[v]], fill=factor(exited))) +
+    geom_density(alpha=0.5, linewidth=0.6) +
+    scale_fill_manual(values=PAL2, name="Exited", labels=c("Retenido","Churn")) +
+    labs(title=v, x=NULL, y="Densidad") +
+    theme(legend.position="bottom")
+) |> (\(p) grid.arrange(grobs=p, ncol=3,
+        top=grid::textGrob("\nDistribución de Variables Numéricas por Clase\n",
+                           gp=grid::gpar(fontface="bold", fontsize=13))))()
+
+
+```
+**Las distribuciones de densidad revelan el poder discriminante de cada variable:**
+
+- **creditscore:** distribuciones casi idénticas entre clases, escasa capacidad predictiva.
+- **age:** clara separación; clientes churn son sistemáticamente mayores (~45–50 años) vs retenidos (~35–40 años).
+- **tenure:** distribuciones prácticamente uniformes y solapadas, años de antigüedad no discriminan churn.
+- **balance:** clientes churn concentran más masa en saldos medios-altos (~100k–200k); retenidos tienen mayor proporción con saldo cero.
+- **numofproducts:** fuerte señal; churn se concentra en 1 producto y casi desaparece en 2 productos,  relación no lineal.
+- **estimatedsalary:** distribuciones casi idénticas, el salario estimado no aporta señal discriminante.
+- **satisfaction_score:** patrón multimodal idéntico en ambas clases, sorprendentemente, el score de satisfacción no discrimina churn en este dataset.
+- **point_earned:** leve solapamiento con pequeña diferencia en la cola derecha, poder discriminante marginal.
+
+**Conclusión:** `age`, `balance` y `numofproducts` son las variables con mayor separación visual entre clases.
+
+
+```{r boxplots, fig.height=8}
+
+PAL2_BOX <- c("0" = "#2E86AB",   # azul océano — Retenido
+              "1" = "#C0392B")   # rojo volcánico — Churn
+
+churn |>
+  select(all_of(c(num_eda,"exited"))) |>
+  pivot_longer(-exited, names_to="variable", values_to="valor") |>
+  ggplot(aes(factor(exited), valor, fill=factor(exited))) +
+  geom_boxplot(outlier.alpha=0.3, outlier.size=0.8, linewidth=0.5) +
+  scale_fill_manual(values=PAL2_BOX, guide="none") +
+  facet_wrap(~variable, scales="free_y", ncol=3) +
+  labs(title="\nBoxplots por variable y clase",
+       x="Exited (0=Retenido, 1=Churn)", y="Valor")
+
+```
+
+::: {.callout-note}
+**Outliers conservados:** perfiles extremos informativos para el kernel RBF.
+:::
+
+**Los boxplots confirman y complementan lo observado en las densidades:**
+
+- **age:** mayor separación entre medianas (~37 retenido vs ~45 churn), variable más discriminante del conjunto. Cajas angostas: valores concentrados, señal limpia.
+- **balance:** mediana churn levemente superior; cajas muy anchas porque el IQR es grande relativo a la escala, alta dispersión interna en ambas clases, señal débil pese a la diferencia visual.
+- **creditscore:** medianas prácticamente idénticas, cajas similares, sin poder discriminante.
+- **estimatedsalary:** cajas anchas y medianas solapadas, distribución uniforme en ambas clases, variable no informativa.
+- **numofproducts:** mediana idéntica (2 productos), pero churn tiene menor dispersión, la señal está en los extremos (1 y 3+ productos), no en la mediana.
+- **point_earned:** cajas casi idénticas en posición y tamaño, sin discriminación.
+- **satisfaction_score:** cajas angostas y medianas iguales (3), el score no diferencia clases.
+- **tenure:** medianas idénticas (~5 años), cajas amplias y solapadas, antigüedad no predice churn.
+
+**Sobre el ancho visual de las cajas:** refleja el tamaño del IQR relativo a la escala del panel (`scales="free_y"`). Cajas anchas indican alta dispersión interna, no mayor discriminación. Lo diagnósticamente relevante es el **desplazamiento vertical entre medianas**, donde `age` es el único caso con separación clara y consistente.
+
+
+```{r cat-plots, fig.height=5}
+
+cat_eda <- intersect(c("geography","gender","card_type"), names(churn))
+map(cat_eda, \(v)
+  churn |> count(.data[[v]], exited) |>
+    group_by(.data[[v]]) |> mutate(prop=n/sum(n)) |> filter(exited==1) |>
+    ggplot(aes(reorder(.data[[v]],prop), prop, fill=.data[[v]])) +
+    geom_col(show.legend=FALSE, width=0.6) +
+    geom_text(aes(label=percent(prop,0.1)), hjust=-0.1, size=3.5) +
+    scale_y_continuous(labels=percent, limits=c(0,0.55)) +
+    coord_flip() +
+    labs(title=paste("Churn por",v), x=NULL, y="% Churn") +
+    scale_fill_brewer(palette="Set2")
+) |> (\(p) grid.arrange(grobs=p, ncol=length(p),
+        top=grid::textGrob("\nTasa de Churn por Variable Categórica\n",
+                           gp=grid::gpar(fontface="bold", fontsize=13))))()
+
+```
+
+La geografía es la variable categórica con mayor diferenciación: Alemania duplica 
+la tasa de churn de Francia y España (~32% vs ~16%), sugiriendo factores de mercado 
+o competencia específicos de ese país. Por género, las mujeres abandonan a mayor tasa 
+(25.1% vs 16.5%), diferencia relevante para segmentación. El tipo de tarjeta no 
+discrimina, Diamond, Platinum, Silver y Gold presentan tasas entre 19–22%, 
+prácticamente homogéneas, por lo que esta variable aportará escasa señal predictiva.
+
+
+## Encoding y matriz de features
+
+```{r prep}
+
+drop_cols <- intersect(c("rownumber","customerid","surname"), names(churn))
+
+churn_model <- churn |>
+  select(-all_of(drop_cols)) |>
+  mutate(exited = factor(exited, levels=c(0,1), labels=c("No","Yes")),
+         across(where(is.character), factor),
+         across(any_of(c("hascreditcard","isactivemember","complain")), factor))
+
+dummies <- dummyVars(exited ~ ., data=churn_model, fullRank=TRUE)
+X_all   <- predict(dummies, newdata=churn_model) |> as.data.frame()
+names(X_all) <- stringr::str_replace_all(names(X_all), "\\.", "_")
+y_all <- churn_model$exited
+
+num_cols_enc <- intersect(NUM_COLS, names(X_all))
+cat(sprintf("Matriz post-encoding: %d × %d\n", nrow(X_all), ncol(X_all)))
+```
+**Antes de modelar, los datos requieren dos transformaciones obligatorias:**
+
+**1. Eliminar identificadores:** `rownumber`, `customerid` y `surname` no contienen 
+información predictiva, son etiquetas administrativas que se descartan.
+
+**2. Encoding categórico (One-Hot):** SVM opera exclusivamente sobre números. Las 
+variables categóricas se convierten en columnas binarias mediante `dummyVars`:
+
+| Variable original | Resultado encoding |
+|---|---|
+| `geography = Germany` | `geographyGermany = 1`, `geographySpain = 0` |
+| `geography = France` | `geographyGermany = 0`, `geographySpain = 0` ← categoría base |
+| `gender = Male` | `genderMale = 1` |
+| `gender = Female` | `genderMale = 0` ← categoría base |
+
+`fullRank=TRUE` omite una categoría por variable (categoría base) para evitar 
+multicolinealidad perfecta, si todas las dummies de una variable suman 1, 
+una es redundante.
+
+El resultado es la matriz `X_all`: todas las observaciones expresadas como números 
+puros, lista para ingresar al pipeline de limpieza y normalización.
+
+
+## Clean Algorithm
+
+::: {.callout-note}
+**Orden:** Clean → Normalización → Feature Selection. Parámetros de normalización se aprenden **solo en Train**.
+:::
+
+```{r clean-algorithm}
+
+# A) Near-zero variance
+nzv_idx <- nearZeroVar(X_all)
+X_clean <- if (length(nzv_idx)>0) { cat("NZV:",length(nzv_idx),"\n"); X_all[,-nzv_idx] } else { cat("✔ Sin NZV.\n"); X_all }
+
+# B) Constantes
+vars_cte <- names(which(sapply(X_clean, sd, na.rm=TRUE) < 1e-8))
+if (length(vars_cte)>0) { cat("Constantes:", paste(vars_cte,collapse=", "),"\n"); X_clean <- X_clean[,!names(X_clean)%in%vars_cte] } else cat("✔ Sin constantes.\n")
+
+# C) Alta correlación |r| ≥ 0.90
+CORR_THR <- 0.90; vars_removed_corr <- character(0)
+repeat {
+  cm_c   <- cor(X_clean, use="pairwise.complete.obs")
+  idx_hi <- which(abs(cm_c) >= CORR_THR & upper.tri(cm_c), arr.ind=TRUE)
+  if (nrow(idx_hi)==0) break
+  best <- idx_hi[which.max(abs(cm_c[idx_hi])),]
+  rem  <- sample(colnames(X_clean)[best], 1)
+  cat(sprintf("|r|=%.3f → elimina '%s'\n", abs(cm_c[best[1],best[2]]), rem))
+  vars_removed_corr <- c(vars_removed_corr, rem)
+  X_clean <- X_clean[,!names(X_clean)%in%rem]
+}
+cat(sprintf("m=%d → q=%d features limpias\n", ncol(X_all), ncol(X_clean)))
+
+```
+
+## División Train / Test
+
+::: {.callout-important}
+**Split estratificado antes de normalizar** — `createDataPartition` preserva la proporción de clases (~80/20) en Train y Test. Parámetros MinMax se aprenden solo en Train.
+:::
+
+```{r split}
+
+set.seed(42)
+idx_tr     <- createDataPartition(y_all, p=0.75, list=FALSE)
+X_tr_clean <- X_clean[idx_tr,];  y_tr <- y_all[idx_tr]
+X_te_clean <- X_clean[-idx_tr,]; y_te <- y_all[-idx_tr]
+cat(sprintf("Train: %d (No:%d Yes:%d) | Test: %d (No:%d Yes:%d) | Features: %d\n",
+            length(y_tr), sum(y_tr=="No"), sum(y_tr=="Yes"),
+            length(y_te), sum(y_te=="No"), sum(y_te=="Yes"),
+            ncol(X_tr_clean)))
+```
+
+## Normalización MinMax
+
+$$Y_j = \frac{X_j - \min_j}{\max_j - \min_j} \quad \Rightarrow \quad Y_j \in [0,1]$$
+
+```{r normalizacion}
+
+pp_mm     <- preProcess(X_tr_clean, method="range")
+X_tr_norm <- predict(pp_mm, X_tr_clean)
+X_te_norm <- predict(pp_mm, X_te_clean)
+
+cat(sprintf("✔ MinMax — Train: %d×%d | Test: %d×%d\n",
+            nrow(X_tr_norm), ncol(X_tr_norm), nrow(X_te_norm), ncol(X_te_norm)))
+```
+
+## Visualización: Línea de Decisión post-Split
+
+::: {.callout-note}
+**Criterio:** la línea se entrena en Train y se **clona** sobre Test, misma geometría, distintos puntos. Se presentan dos perspectivas complementarias: escala original (interpretabilidad de negocio) y proyección PCA (máxima varianza explicada).
+
+**Nota sobre `balance=0`:** en el plot de escala original aparecen puntos en línea recta horizontal en y=0. Esto refleja fielmente la distribución real del dataset, una fracción importante de clientes tiene saldo cero, lo cual es un patrón informativo y no un error.
+
+**Círculos negros en el plot PCA:** son los **vectores de soporte** del SVM auxiliar, los puntos más cercanos a la frontera de decisión que definen el margen. A mayor número de SVs, más compleja es la frontera.
+:::
+
+### Escala original: dos variables más discriminantes (Fisher J)
+
+```{r boundary-original, fig.width=11, fig.height=5}
+
+# Fisher J pre-selección sobre continuas disponibles en churn original
+fj_pre  <- map_dbl(num_cols_enc, \(v) {
+  g1 <- X_tr_norm[[v]][y_tr=="No"]; g2 <- X_tr_norm[[v]][y_tr=="Yes"]
+  d  <- var(g1)+var(g2); if(d==0) 0 else (mean(g1)-mean(g2))^2/d
+})
+vars_2d <- tibble(variable=num_cols_enc, fj=fj_pre) |>
+  filter(variable %in% names(churn)) |>
+  arrange(desc(fj)) |> slice(1:2) |> pull(variable)
+
+if (length(vars_2d)<2) vars_2d <- intersect(num_cols_enc, names(churn))[1:2]
+v1 <- vars_2d[1]; v2 <- vars_2d[2]
+cat(sprintf("Par 2D: %s  vs  %s\n", v1, v2))
+
+# SVM auxiliar entrenado en espacio NORMALIZADO
+df_tr2_norm <- X_tr_norm[, c(v1,v2), drop=FALSE] |> as.data.frame() |>
+  mutate(exited=y_tr, conjunto="Train (ajuste)")
+df_te2_norm <- X_te_norm[, c(v1,v2), drop=FALSE] |> as.data.frame() |>
+  mutate(exited=y_te, conjunto="Test (generalización)")
+
+svm_2d <- svm(exited~., data=df_tr2_norm[,c(v1,v2,"exited")],
+              kernel="radial", cost=1, gamma=0.5, decision.values=TRUE)
+
+# Grid en espacio normalizado [0,1]
+g2d_norm <- expand.grid(
+  seq(0, 1, length.out=200),
+  seq(0, 1, length.out=200)) |> setNames(c(v1,v2))
+g2d_norm$pred     <- predict(svm_2d, newdata=g2d_norm)
+g2d_norm$decision <- as.numeric(attr(predict(svm_2d, newdata=g2d_norm,
+                                             decision.values=TRUE), "decision.values"))
+
+# Reconvertir grid a escala original para el eje visual
+rng    <- pp_mm$ranges
+min_v1 <- rng[1, v1]; max_v1 <- rng[2, v1]
+min_v2 <- rng[1, v2]; max_v2 <- rng[2, v2]
+
+g2d_orig <- g2d_norm |>
+  mutate(!!v1 := .data[[v1]] * (max_v1 - min_v1) + min_v1,
+         !!v2 := .data[[v2]] * (max_v2 - min_v2) + min_v2)
+
+# Puntos en escala original
+df_2d <- churn[, c(v1,v2), drop=FALSE]; df_2d$exited <- y_all
+df_tr2 <- df_2d[idx_tr,]  |> mutate(conjunto="Train (ajuste)")
+df_te2 <- df_2d[-idx_tr,] |> mutate(conjunto="Test (generalización)")
+
+df_pts <- bind_rows(df_tr2, df_te2) |>
+  mutate(exited   = factor(exited, levels=levels(y_tr)),
+         conjunto = factor(conjunto, levels=c("Train (ajuste)","Test (generalización)")))
+
+bind_rows(g2d_orig |> mutate(conjunto="Train (ajuste)"),
+          g2d_orig |> mutate(conjunto="Test (generalización)")) |>
+  mutate(conjunto=factor(conjunto, levels=c("Train (ajuste)","Test (generalización)"))) |>
+  ggplot() +
+  geom_tile(aes(.data[[v1]],.data[[v2]],fill=pred), alpha=0.25) +
+  geom_contour(aes(.data[[v1]],.data[[v2]],z=decision),
+               breaks=0, color="black", linewidth=1.2) +
+  geom_point(data=df_pts, aes(.data[[v1]],.data[[v2]],color=exited,shape=exited),
+             size=0.9, alpha=0.55) +
+  facet_wrap(~conjunto, ncol=2) +
+  scale_fill_manual(values=c(No="#4a235a",Yes="#1a6b3c"),
+                    labels=c(No="Retenido",Yes="Churn"), name="Región") +
+  scale_color_manual(values=c(No="#7d3c98",Yes="#27ae60"),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  scale_shape_manual(values=c(No=16,Yes=17),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  labs(title    = "Línea de Decisión SVM RBF — Escala Original",
+       subtitle = paste0("── Línea negra: frontera f=0 (clonada Train→Test)\n",
+                         v1," (x)  vs  ",v2," (y) | Puntos en y=0: clientes con balance=0"),
+       x=v1, y=v2) +
+  theme(legend.position="bottom", strip.text=element_text(face="bold",size=11))
+
+```
+
+**La línea delimita una zona de riesgo en forma de "U"**
+
+- Clientes sobre ~45 años con saldo medio-alto concentran el churn (churn = 1, 
+  cliente abandona la institución), cayendo en la **zona verde de abandono**,
+  perfil maduro con patrimonio acumulado y mayor capacidad para evaluar alternativas.
+- Clientes jóvenes y con balance=0 caen sin excepción en la **zona morada de 
+  retención** (churn = 0, cliente permanece en la institución).
+- El Test replica la misma geometría que Train — el modelo no memorizó, aprendió 
+  una estructura real.
+  
+<br>
+
+El **Análisis de Componentes Principales** (PCA) es una transformación lineal que proyecta 
+los datos desde el espacio original $\mathbb{R}^p$ hacia un subespacio de menor dimensión 
+$\mathbb{R}^k$ ($k \ll p$), maximizando la varianza retenida:
+
+$$\mathbf{Z} = \mathbf{X} W, \quad W = [\mathbf{w}_1, \mathbf{w}_2, \ldots, \mathbf{w}_k]$$
+
+donde cada $\mathbf{w}_j$ es el $j$-ésimo vector propio de la matriz de covarianza 
+$\Sigma = \frac{1}{n}\mathbf{X}^\top\mathbf{X}$, ordenados por varianza explicada decreciente.
+
+En este documento PCA cumple un rol **exclusivamente visual**: proyectar las 
+$q$ features limpias y normalizadas a $\mathbb{R}^2$ para graficar la frontera de 
+decisión del SVM. El modelo **nunca se entrena sobre componentes principales** — 
+opera siempre sobre las features seleccionadas en $\mathbb{R}^p$. Para evitar 
+*data leakage*, $W$ se estima únicamente sobre Train y se aplica por transformación 
+a Test.  
+  
+### Proyección PCA 2D: máxima varianza explicada
+
+```{r boundary-pca, fig.width=11, fig.height=5}
+
+# PCA entrenado solo en X_tr_norm — sin leakage
+pca_pre <- prcomp(X_tr_norm, center=FALSE, scale.=FALSE)
+var_exp <- round(summary(pca_pre)$importance[2,1:2]*100, 1)
+
+PC_tr <- as.data.frame(pca_pre$x[,1:2]) |> setNames(c("PC1","PC2")) |> mutate(exited=y_tr)
+PC_te <- as.data.frame(predict(pca_pre, X_te_norm)[,1:2]) |> setNames(c("PC1","PC2")) |> mutate(exited=y_te)
+
+# SVM auxiliar en espacio PCA con decision.values para contorno explícito
+svm_pca     <- svm(exited~PC1+PC2, data=PC_tr, kernel="radial",
+                   cost=1, gamma=0.1, decision.values=TRUE)
+
+rng1 <- range(c(PC_tr$PC1,PC_te$PC1)); rng2 <- range(c(PC_tr$PC2,PC_te$PC2))
+g_pca <- expand.grid(PC1=seq(rng1[1]-.3,rng1[2]+.3,length.out=250),
+                     PC2=seq(rng2[1]-.3,rng2[2]+.3,length.out=250))
+g_pca$pred     <- predict(svm_pca, newdata=g_pca)
+g_pca$decision <- as.numeric(attr(predict(svm_pca, newdata=g_pca, decision.values=TRUE),
+                                  "decision.values"))
+
+# Vectores de soporte
+sv_pca <- PC_tr[svm_pca$index,] |> mutate(conjunto="Train (ajuste)")
+cat(sprintf("Vectores de soporte (SVM auxiliar PCA): %d/%d (%.1f%%)\n",
+            nrow(sv_pca), nrow(PC_tr), nrow(sv_pca)/nrow(PC_tr)*100))
+
+bind_rows(PC_tr|>mutate(conjunto="Train (ajuste)"),
+          PC_te|>mutate(conjunto="Test (generalización)")) |>
+  mutate(exited   = factor(exited, levels=levels(y_tr)),
+         conjunto = factor(conjunto, levels=c("Train (ajuste)","Test (generalización)"))) |>
+  ggplot() +
+  geom_tile(data=bind_rows(g_pca|>mutate(conjunto="Train (ajuste)"),
+                           g_pca|>mutate(conjunto="Test (generalización)")) |>
+              mutate(conjunto=factor(conjunto,levels=c("Train (ajuste)","Test (generalización)"))),
+            aes(PC1,PC2,fill=pred), alpha=0.25) +
+  # Frontera explícita f=0
+  geom_contour(data=bind_rows(g_pca|>mutate(conjunto="Train (ajuste)"),
+                              g_pca|>mutate(conjunto="Test (generalización)")) |>
+                 mutate(conjunto=factor(conjunto,levels=c("Train (ajuste)","Test (generalización)"))),
+               aes(PC1,PC2,z=decision), breaks=0, color="black", linewidth=1.2) +
+  geom_point(aes(PC1,PC2,color=exited,shape=exited), size=0.9, alpha=0.55) +
+  # Vectores de soporte solo en Train
+  geom_point(data=sv_pca, aes(PC1,PC2),
+             shape=21, size=2.5, stroke=0.9, color="black", fill=NA) +
+  facet_wrap(~conjunto, ncol=2) +
+  scale_fill_manual(values=c(No="#4a235a",Yes="#1a6b3c"),
+                    labels=c(No="Retenido",Yes="Churn"), name="Región") +
+  scale_color_manual(values=c(No="#7d3c98",Yes="#27ae60"),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  scale_shape_manual(values=c(No=16,Yes=17),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  labs(title    = "Línea de Decisión SVM RBF — Proyección PCA",
+       subtitle = paste0("PC1(",var_exp[1],"%) + PC2(",var_exp[2],"%) = ",sum(var_exp),
+                         "% varianza\n── Línea negra: frontera f=0 (clonada Train→Test)  ○ Vectores de soporte (Train)"),
+       x=paste0("PC1 (",var_exp[1],"%)"), y=paste0("PC2 (",var_exp[2],"%)")) +
+  theme(legend.position="bottom", strip.text=element_text(face="bold",size=11))
+
+```
+**La Línea de desición es casi horizontal: el SVM separa principalmente por PC2, no por PC1**
+
+- **Puntos morados (triángulos/círculos):** clientes Retenidos, zona superior (PC2 > ~-0.9).
+- **Puntos verdes (triángulos):** clientes Churn, zona inferior (PC2 < ~-0.9).
+- **Círculos negros vacíos:** vectores de soporte (SV), son los puntos de ambas clases 
+  más cercanos a la línea f=0. No son una clase aparte; son puntos morados o verdes 
+  que el SVM identificó como críticos para definir y sostener el margen de separación. 
+  Solo se grafican en Train porque el modelo se entrena ahí.
+- **Línea negra sólida (f=0):** línea de decisión, separa ambas regiones.
+- Test replica la misma frontera sin reentrenamiento, generalización consistente.
+
+El 64.6% de varianza explicada entre PC1 y PC2 es moderado; la separación no es 
+perfecta, lo que es coherente con el solapamiento observado en las densidades del EDA.
+
+---
+
+# Fundamentos Matemáticos de SVM {#sec-fundamentos}
+
+**Hiperplano de máximo margen:**
+$$f(\mathbf{x}) = \text{sign}(\mathbf{w}^\top \mathbf{x} + b) \qquad \text{Margen} = \frac{2}{\|\mathbf{w}\|}$$
+
+**Problema primal (Soft Margin):**
+$$\min_{\mathbf{w},b,\boldsymbol{\xi}} \frac{1}{2}\|\mathbf{w}\|^2 + C\sum_i \xi_i \quad \text{s.a.} \quad y_i(\mathbf{w}^\top\mathbf{x}_i+b) \geq 1-\xi_i$$
+
+**Formulación dual:**
+$$\max_{\boldsymbol{\alpha}} \sum_i\alpha_i - \frac{1}{2}\sum_{i,j}\alpha_i\alpha_j y_i y_j K(\mathbf{x}_i,\mathbf{x}_j)$$
+
+**Kernel RBF:**
+$$K(\mathbf{x}_i,\mathbf{x}_j) = \exp(-\gamma\|\mathbf{x}_i-\mathbf{x}_j\|^2)$$
+
+**Métricas:**
+$$F_1 = 2\cdot\frac{P\cdot R}{P+R} \qquad \text{AUC-ROC} = \int_0^1 \text{TPR}(t)\,dt$$
+
+---
+
+# Fase 3: Selección de Características {#sec-seleccion}
+
+## Marco conceptual
+
+**k_comun:** fuerza la misma dimensionalidad en todos los selectores para una
+comparativa justa. Se determina a partir de Random Forest: `k_comun = max(k_rf, 6)`.
+Los 4 restantes (B&B, Lasso, XGBoost, MI) reciben k_comun directamente.
+
+Random Forest es elegido como referencia por ser el único de los tres con k natural
+que evalúa variables de forma multivariada: sus 300 árboles capturan interacciones
+que Fisher J y SFS no detectan, ya que ambos colapsan a k=1 — el primero por ser
+univariado, el segundo por criterio de ganancia marginal. RF identifica k=3 variables
+genuinamente informativas, y el piso de 6 garantiza dimensionalidad suficiente para
+que el SVM RBF explote combinaciones más allá de `complain`.
+
+| Selector | Tipo | Criterio | k natural |
+|---|---|---|---|
+| Fisher J | Ranking individual | $J_F$ univariado binario | ✔ umbral μ+0.5σ |
+| SFS | Búsqueda greedy | AUC-SVM incremental | ✔ ganancia marginal |
+| Random Forest | Ranking individual | MeanDecreaseAccuracy | ✔ umbral μ+0.5σ |
+| Branch & Bound | Búsqueda exhaustiva | Fisher multivariado | — recibe k_comun |
+| Lasso L1 | Regularización | $\|\boldsymbol{\beta}\|_1$ penalización | — recibe k_comun |
+| XGBoost | Ranking ensemble | Gain no lineal | — recibe k_comun |
+| Mutual Information | Filtro no paramétrico | $I(X;Y)$ | — recibe k_comun |
+
+Todos compiten con el **mismo k, mismo SVM evaluador (C=1, γ=0.1) y misma validación cruzada CV-5 sobre Train**. Test permanece reservado para la evaluación final del modelo en la Fase 5.
+:::
+
+## Definiciones formales
+
+**Fisher J univariado — criterio de separabilidad por clase:**
+$$J_F(x) = \frac{(\mu_{pos}-\mu_{neg})^2}{\sigma^2_{pos}+\sigma^2_{neg}}$$
+
+**Branch & Bound — búsqueda combinatorial con criterio Fisher J multivariado:**
+$$J(\mathcal{S}) = \mathbf{d}^\top S_w^{-1}\mathbf{d}$$
+donde $\mathbf{d} = \mu_1 - \mu_2$ y $S_w$ es la covarianza within-class pooled. B\&B usa $J(\mathcal{S})$ como función objetivo para evaluar y podar subconjuntos de variables.
+
+**SFS — regla de incorporación greedy por AUC-SVM:**
+$$\mathcal{F}_{k+1} = \mathcal{F}_k \cup \left\{\arg\max_{x \notin \mathcal{F}_k} \text{AUC}_{\text{SVM}}(\mathcal{F}_k \cup \{x\})\right\}$$
+
+**Random Forest — importancia por permutación (Mean Decrease Accuracy):**
+$$\text{Imp}(x_j) = \frac{1}{B}\sum_{b=1}^B\left(\text{Acc}_b - \text{Acc}_b^{\text{perm}(j)}\right)$$
+
+**Lasso L1 — regresión logística con penalización por dispersión:**
+$$\min_{\boldsymbol{\beta}} \sum_i \log(1+e^{-y_i \mathbf{x}_i^\top\boldsymbol{\beta}}) + \lambda\|\boldsymbol{\beta}\|_1$$
+
+**Mutual Information — dependencia no lineal entre feature y clase:**
+$$I(X_j;Y) = \sum_{x,y} p(x,y)\log\frac{p(x,y)}{p(x)p(y)}$$
+
+## Features de entrada a selectores
+
+```{r fs-input-summary}
+
+cat(sprintf("Features que entran a los 7 selectores: %d\n%s",
+            ncol(X_tr_norm),
+            paste(names(X_tr_norm), collapse=" | ")))
+
+```
+
+
+## Setup común
+
+El **setup común** define los ingredientes compartidos que todos los selectores usan sin excepción:
+
+- **`all_cols_fs`:** lista de las features limpias y normalizadas que entran a competir.
+- **`idx_no` / `idx_yes`:** índices de filas por clase, evita recalcularlos en cada selector.
+- **`fisher_j()`:** función que calcula el score Fisher univariado de una variable.
+- **`fisher_scores`:** vector con el score $J_F$ de cada feature, ordenado descendentemente.
+- **`eval_svm_cv()`:** función evaluadora común. Entrena un SVM (C=1, γ=0.1) mediante **validación cruzada estratificada de 5 pliegues exclusivamente sobre Train** y retorna AUC, F1 y Kappa promediados sobre los 5 folds. Test no interviene en esta etapa, quedando reservado para la evaluación final del modelo en la Fase 5. Esto garantiza que la comparativa entre selectores refleje la calidad real de cada subconjunto de variables sin contaminación por datos de prueba.
+
+La clave es `eval_svm_cv()`: **todos los selectores son juzgados por el mismo árbitro**, garantizando que las diferencias en métricas reflejen la calidad del subconjunto de variables, no del modelo evaluador.
+
+```{r fs-setup}
+
+# Setup común
+
+all_cols_fs <- names(X_tr_norm)
+idx_no      <- which(y_tr == "No")
+idx_yes     <- which(y_tr == "Yes")
+
+fisher_j <- function(x) {
+  g1 <- x[idx_no]; g2 <- x[idx_yes]; d <- var(g1) + var(g2)
+  if (is.na(d) || d == 0) 0 else (mean(g1) - mean(g2))^2 / d
+}
+
+fisher_scores <- setNames(map_dbl(all_cols_fs, ~fisher_j(X_tr_norm[[.x]])), all_cols_fs)
+fisher_df     <- tibble(variable = all_cols_fs, fisher_J = fisher_scores) |>
+                   arrange(desc(fisher_J))
+
+# Operador null-coalesce
+
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !is.na(a[1])) a else b
+
+# Evaluador honesto: CV-5 sobre Train únicamente
+# Test queda completamente fuera; se reserva para la Fase 5.
+
+ctrl_fs <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter     = FALSE
+)
+
+safe_round <- function(x, digits = 4) {
+  x <- suppressWarnings(as.numeric(x))
+  round(ifelse(is.na(x) | is.nan(x), 0, x), digits)
+}
+
+eval_svm <- function(vars, label) {
+  df_tr   <- as.data.frame(X_tr_norm[, vars, drop = FALSE])
+  df_tr$y <- y_tr
+
+  set.seed(42)
+  m_cv <- suppressWarnings(
+    train(
+      y ~ .,
+      data      = df_tr,
+      method    = "svmRadial",
+      trControl = ctrl_fs,
+      tuneGrid  = data.frame(C = 1, sigma = 0.1),
+      metric    = "ROC"
+    )
+  )
+
+  kappa_cv <- tryCatch({
+    preds <- m_cv$pred
+    cm_cv <- confusionMatrix(preds$pred, preds$obs, positive = "Yes")
+    safe_round(cm_cv$overall["Kappa"])
+  }, error = \(e) NA_real_)
+
+  f1_cv <- tryCatch({
+    preds <- m_cv$pred
+    cm_cv <- confusionMatrix(preds$pred, preds$obs, positive = "Yes")
+    safe_round(cm_cv$byClass["F1"])
+  }, error = \(e) NA_real_)
+
+  tibble(
+    Selector = label,
+    k        = length(vars),
+    AUC_cv   = safe_round(m_cv$results$ROC),
+    F1_cv    = f1_cv,
+    Kappa_cv = kappa_cv,
+    features = paste(vars, collapse = " | ")
+  )
+}
+```
+
+## Paso 1: k natural de cada selector
+
+### Fisher J
+
+```{r k-fisher}
+
+umbral_fisher <- mean(fisher_df$fisher_J) + 0.5*sd(fisher_df$fisher_J)
+k_fisher      <- sum(fisher_df$fisher_J >= umbral_fisher)
+
+cat(sprintf("Fisher J — umbral: %.4f | k: %d\n", umbral_fisher, k_fisher))
+```
+- **Umbral (57.197):** valor de corte $\mu + 0.5\sigma$ sobre todos los scores Fisher, 
+  solo variables con $J_F$ superior a este valor se consideran discriminantes.
+- **k (1):** número de variable que superan el umbral, `complain` domina tan 
+  fuertemente que las demás quedan por debajo, de ahí la necesidad del piso `k_comun`.
+
+### SFS
+
+```{r k-sfs}
+
+pool_sfs <- fisher_df$variable[1:min(20, nrow(fisher_df))]
+sel_sfs  <- character(0)
+rem_sfs  <- pool_sfs
+sfs_res  <- list()
+
+for (s in seq_along(pool_sfs)) {
+
+  sc <- map_dbl(rem_sfs, \(v) {
+    tryCatch({
+      m <- suppressWarnings(
+        svm(
+          x           = X_tr_norm[, c(sel_sfs, v), drop = FALSE],
+          y           = y_tr,
+          kernel      = "radial",
+          cost        = 1,
+          gamma       = 0.1,
+          probability = TRUE,
+          cross       = 5
+        )
+      )
+      # CV accuracy nativo de e1071 — suficiente para ordenar candidatas
+      as.numeric(m$tot.accuracy) / 100
+    }, error = \(e) 0)
+  })
+
+  best_v  <- rem_sfs[which.max(sc)]
+  sel_sfs <- c(sel_sfs, best_v)
+  rem_sfs <- setdiff(rem_sfs, best_v)
+
+  sfs_res[[s]] <- tibble(
+    Paso              = s,
+    Variable          = best_v,
+    AUC_CV_acum       = round(max(sc), 4),
+    Ganancia_marginal = round(
+      ifelse(s == 1, max(sc), max(sc) - sfs_res[[s - 1]]$AUC_CV_acum), 4
+    )
+  )
+
+  if (s >= 4 && sfs_res[[s]]$Ganancia_marginal < 0.001) break
+}
+
+sfs_df <- bind_rows(sfs_res)
+gains  <- sfs_df$Ganancia_marginal
+k_sfs  <- max(which(gains >= mean(gains)))
+
+cat(sprintf("SFS — k: %d | AUC CV: %.4f\n", k_sfs, sfs_df$AUC_CV_acum[k_sfs]))
+
+
+```
+
+- **k (1):** el SFS detuvo la búsqueda tras agregar 1 sola variable, la ganancia 
+  marginal en AUC al añadir una segunda feature fue inferior al umbral de corte.
+- **AUC CV (0.9987):** AUC promedio en validación cruzada de 5 pliegues sobre Train. 
+  Con solo 1 variable (`complain`) el SVM clasifica casi perfectamente, confirmando 
+  el dominio absoluto de esa feature en este dataset.
+
+### Random Forest
+
+```{r k-rf}
+
+set.seed(42)
+rf_mod    <- randomForest(x=X_tr_norm, y=y_tr, ntree=300, importance=TRUE)
+imp_df    <- tibble(variable=rownames(importance(rf_mod,type=1)),
+                    imp=importance(rf_mod,type=1)[,1]) |> arrange(desc(imp))
+umbral_rf <- mean(imp_df$imp) + 0.5*sd(imp_df$imp)
+k_rf      <- max(sum(imp_df$imp >= umbral_rf), 3L)
+
+cat(sprintf("RF — umbral: %.4f | k: %d\n", umbral_rf, k_rf))
+```
+- **Umbral (46.439):** valor de corte $\mu + 0.5\sigma$ sobre la importancia MDA 
+  de los 300 árboles, variables con impacto promedio superior a este valor se retienen.
+- **k (3):** 3 variables superan el umbral, RF distribuye mejor la importancia 
+  que Fisher J, capturando señal más allá de `complain`.
+  
+> Observación: Mean Decrease Accuracy, caída promedio en accuracy al permutar aleatoriamente una variable en los datos out-of-bag. Mayor caída = variable más importante para el modelo.
+
+### k común
+
+```{r k-comun}
+
+k_optimo <- max(k_rf, 6L)
+cat(sprintf("Fisher:%d | SFS:%d | RF:%d → k_comun:%d (basado en RF)\n",
+            k_fisher, k_sfs, k_rf, k_optimo))
+
+```
+
+::: {.callout-note}
+**k_comun = `r k_optimo`**
+
+Los tres selectores con k natural (Fisher J, SFS, RF) convergieron a k=1–3 dado el 
+fuerte dominio de `complain`. Un k tan bajo limita la capacidad del SVM RBF para 
+explotar interacciones multivariadas, por lo que se establece **k_comun = 6** como 
+piso metodológico.
+
+El valor **6L** es un entero fijo en R (`L` indica tipo integer) que actúa como 
+garantía mínima: `k_optimo <- max(k_rf, 6L)` asegura que aunque RF detecte menos 
+variables relevantes, todos los selectores evalúen al menos 6 features. Esto amplía 
+el pool de B&B a 12 variables candidatas y obliga a Lasso, XGBoost y MI a competir 
+en mayor dimensionalidad, revelando si variables secundarias aportan señal real 
+más allá de `complain`.
+
+- Permite evaluar combinaciones más ricas en B&B, Lasso, XGBoost y MI.
+- Es consistente con la dimensionalidad del problema, ~35% de las features limpias.
+- La evidencia empírica en churn bancario sitúa entre 4 y 6 variables el punto de 
+  mayor varianza predictiva capturada.
+
+La comparativa sigue siendo justa: todos los selectores compiten con el mismo k, 
+mismo SVM evaluador y misma validación cruzada CV-5 sobre Train.
+:::
+
+---
+
+## Paso 2: Selección con k_comun features
+
+### Selector 1: Fisher J
+
+```{r sel-fisher}
+
+vars_fisher <- fisher_df |> slice_head(n=k_optimo) |> pull(variable)
+
+ggplot(fisher_df |> slice_head(n=min(25,nrow(fisher_df))),
+       aes(reorder(variable,fisher_J), fisher_J, fill=fisher_J)) +
+  geom_col(width=0.7, color="white") +
+  geom_hline(yintercept=fisher_df$fisher_J[k_optimo],
+             linetype="dashed", color="#e74c3c", linewidth=0.8) +
+  scale_fill_gradient(low="#85c1e9", high="#1a5276", guide="none") +
+  coord_flip() +
+  scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title    = sprintf("Fisher J — ranking de %d variables", nrow(fisher_df)),
+     subtitle = sprintf("Variable seleccionada: %s | J_F = %.4f",
+                        vars_fisher, umbral_fisher),
+     x=NULL, y=expression(J[F]))
+
+# Evalúa SVM con features Fisher J — CV-5 sobre Train
+res_fisher <- eval_svm(vars_fisher, "Fisher J")
+
+```
+- **$J_F$ (Fisher J):** razón entre la separación de medias inter-clase y la varianza
+  intra-clase. Mayor $J_F$ = mayor poder discriminante univariado.
+- El gráfico muestra el **ranking completo de $J_F$** para las 17 variables del dataset.
+  `complain_1` domina de forma absoluta ($J_F = 57.197$), mientras el resto de variables
+  presenta valores cercanos a cero en comparación — la escala del eje lo hace evidente.
+- La **línea roja punteada** marca el corte `k_optimo = 6`: solo `complain_1` supera
+  el umbral natural ($\mu + 0.5\sigma$), de ahí que el k natural de Fisher sea 1.
+  Las 5 variables restantes se incorporan por el piso metodológico `k_comun = 6`,
+  no por criterio Fisher propio.
+
+
+### Selector 2: SFS
+
+```{r sel-sfs}
+
+vars_sfs <- intersect(sfs_df$Variable[1:min(k_optimo, nrow(sfs_df))], names(X_tr_norm))
+
+sfs_df |>
+  slice_head(n = min(k_optimo, nrow(sfs_df))) |>
+  kbl(
+    caption   = sprintf("SFS — top %d variables seleccionadas (criterio AUC CV sobre Train)",
+                        min(k_optimo, nrow(sfs_df))),
+    col.names = c("Paso", "Variable añadida", "AUC CV acumulado", "Ganancia marginal")
+  ) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 11
+  )
+
+# Evalúa SVM con features SFS — CV-5 sobre Train
+res_sfs <- eval_svm(vars_sfs, "SFS")
+
+
+```
+
+- **AUC CV acumulado:** AUC promedio en validación cruzada de 5 pliegues sobre Train tras añadir cada variable; 0.5 es azar puro, 1.0 es separación perfecta.
+- **Ganancia marginal:** incremento de AUC al incorporar cada variable. complain_1 por sí sola alcanza un AUC de 0.9987, lo que indica que esta variable es prácticamente suficiente para separar las clases. Las variables restantes no aportan ganancia adicional detectable a 4 decimales.
+
+
+### Selector 3: Branch & Bound
+
+```{r sel-bb}
+
+pool_bb    <- fisher_df$variable[1:min(2L*k_optimo, length(all_cols_fs))]
+fi_pool_bb <- fisher_scores[pool_bb]
+
+fisher_multi <- function(vars) {
+  X_sub <- as.matrix(X_tr_norm[c(idx_no,idx_yes), vars, drop=FALSE])
+  y_bin <- c(rep(0L,length(idx_no)), rep(1L,length(idx_yes)))
+  g1 <- X_sub[y_bin==0L,,drop=FALSE]; g2 <- X_sub[y_bin==1L,,drop=FALSE]
+  m1 <- colMeans(g1); m2 <- colMeans(g2)
+  Sw <- ((nrow(g1)-1L)*cov(g1)+(nrow(g2)-1L)*cov(g2))/(nrow(g1)+nrow(g2)-2L)
+  dm <- matrix(m1-m2, ncol=1L)
+  tryCatch(as.numeric(t(dm)%*%solve(Sw+diag(1e-8,ncol(Sw)))%*%dm),
+           error=\(e) sum((m1-m2)^2/(diag(Sw)+1e-8)))
+}
+
+best_score_bb <- 0; best_subset <- pool_bb[1:k_optimo]
+tryCatch({ best_score_bb <- fisher_multi(best_subset) }, error=\(e){})
+if (!is.finite(best_score_bb)) best_score_bb <- 0
+nodes_visited <- 0L; MAX_NODES <- 50000L
+
+bb_search <- function(sel_idx, rem_idx, depth) {
+  if (nodes_visited >= MAX_NODES) return(invisible(NULL))
+  if (depth == k_optimo) {
+    nodes_visited <<- nodes_visited + 1L
+    sc <- tryCatch(fisher_multi(pool_bb[sel_idx]), error=\(e) 0)
+    if (is.finite(sc) && sc > best_score_bb) {
+      best_score_bb <<- sc; best_subset <<- pool_bb[sel_idx] }
+    return(invisible(NULL))
+  }
+  for (i in seq_along(rem_idx)) {
+    nodes_visited <<- nodes_visited + 1L
+    if (nodes_visited >= MAX_NODES) return(invisible(NULL))
+    ri <- rem_idx[i]; rest <- rem_idx[-seq_len(i)]
+    bound <- fi_pool_bb[ri] + sum(head(sort(fi_pool_bb[rest],decreasing=TRUE),
+                                       k_optimo-depth-1L))
+    if (bound <= best_score_bb) next
+    bb_search(c(sel_idx,ri), rest, depth+1L)
+  }
+}
+bb_search(integer(0), seq_along(pool_bb), 0L)
+vars_bb <- best_subset
+cat(sprintf("B&B — k=%d | Nodos:%d | Fisher multi:%.4f\n",
+            k_optimo, nodes_visited, best_score_bb))
+
+# Evalúa SVM con features B&B — CV-5 sobre Train
+res_bb <- eval_svm(vars_bb, "Branch & Bound")
+
+```
+
+- **k (6):** features evaluadas en la búsqueda combinatorial.
+- **Nodos (12):** combinaciones exploradas antes de converger — B&B podó el árbol 
+  agresivamente gracias a las cotas Fisher.
+- **Fisher multi (747.96):** criterio $J(\mathcal{S})$ del subconjunto óptimo encontrado,
+  separabilidad multivariada del conjunto seleccionado. 
+  
+
+### Selector 4 — Random Forest
+
+```{r sel-rf}
+
+vars_rf <- imp_df |> slice_head(n=k_optimo) |> pull(variable)
+
+ggplot(imp_df |> slice_head(n=min(25,nrow(imp_df))),
+       aes(reorder(variable,imp), imp, fill=imp)) +
+  geom_col(width=0.7, color="white") +
+  geom_hline(yintercept=imp_df$imp[k_optimo],
+             linetype="dashed", color="#e74c3c", linewidth=0.8) +
+  scale_fill_gradient(low="#f9e79f", high="#d35400", guide="none") +
+  coord_flip() +
+  scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title    = sprintf("RF — %d variables, k seleccionadas: %d",
+                         nrow(imp_df), k_optimo),
+     subtitle = sprintf("Línea roja: corte k_comun = %d | umbral MDA = %.2f",
+                         k_optimo, umbral_rf),
+     x=NULL, y="MDA")+
+  theme(axis.text.y=element_text(size=8))
+
+# Evalúa SVM con features RF — CV-5 sobre Train
+res_rf <- eval_svm(vars_rf, "Random Forest")
+```
+- **MDA (Mean Decrease Accuracy):** caída promedio en accuracy al permutar aleatoriamente
+  una variable en los árboles out-of-bag. Mayor caída = variable más importante.
+- El gráfico muestra el **ranking completo de importancia MDA** para las 17 variables
+  del dataset. La **línea roja punteada** marca el corte en `k_optimo = 6`: las barras
+  por encima son las variables seleccionadas; las restantes quedan descartadas.
+  El hecho de que aparezcan 17 barras no implica que todas sean seleccionadas —
+  el plot expone el ranking completo para contextualizar la posición relativa de
+  cada variable y justificar visualmente el corte aplicado.
+
+### Selector 5 — Lasso L1
+
+```{r sel-lasso}
+
+set.seed(42)
+lasso_cv   <- cv.glmnet(x=as.matrix(X_tr_norm), y=ifelse(y_tr=="Yes",1,0),
+                         family="binomial", alpha=1, nfolds=5, type.measure="auc")
+lasso_coef <- coef(lasso_cv, s="lambda.min")[-1,1]
+lasso_imp  <- tibble(variable=names(lasso_coef), imp=abs(lasso_coef)) |>
+  arrange(desc(imp))
+
+# Siempre tomar top k_optimo (con o sin ceros)
+vars_lasso <- lasso_imp |> slice_head(n=k_optimo) |> pull(variable)
+
+ggplot(lasso_imp |> slice_head(n=min(25,nrow(lasso_imp))),
+       aes(reorder(variable,imp), imp, fill=imp)) +
+  geom_col(width=0.7, color="white") +
+  geom_hline(yintercept=lasso_imp$imp[k_optimo],
+             linetype="dashed", color="#e74c3c", linewidth=0.8) +
+  scale_fill_gradient(low="#d2b4de", high="#6c3483", guide="none") +
+  coord_flip() +
+  scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title = sprintf("Lasso L1 — %d variables, k seleccionadas: %d",
+                      nrow(lasso_imp), k_optimo),
+       subtitle=sprintf("λ óptimo: %.5f | vars no-cero: %d",
+                        lasso_cv$lambda.min, sum(abs(lasso_coef)>0)),
+       x=NULL, y="|Coeficiente|") +
+  theme(axis.text.y=element_text(size=8))
+
+# Evalúa SVM con features Lasso L1 — CV-5 sobre Train
+res_lasso <- eval_svm(vars_lasso, "Lasso L1")
+```
+- **|Coeficiente| (Lasso L1):** valor absoluto del coeficiente logístico penalizado.
+  La penalización $\lambda$ encoge coeficientes hacia cero — variables irrelevantes
+  quedan exactamente en cero y son eliminadas automáticamente.
+- Con $\lambda$ óptimo = 0.00021 (seleccionado por CV-5), **10 variables retienen
+  coeficiente no-cero**; las 7 restantes son anuladas por la penalización.
+- La **línea roja punteada** marca el corte `k_optimo = 6`: se seleccionan las 6
+  variables con mayor $|\beta|$ — `complain_1` domina ampliamente, seguida de `age`
+  con separación notable respecto al resto.
+- `balance`, `creditscore` y los tipos de tarjeta presentan coeficiente prácticamente
+  nulo pese a no ser eliminados, confirmando su escasa contribución marginal bajo
+  regularización L1.
+
+
+### Selector 6 — XGBoost Gain
+
+```{r sel-xgb}
+
+set.seed(42)
+xgb_mat <- xgb.DMatrix(data=as.matrix(X_tr_norm), label=ifelse(y_tr=="Yes",1,0))
+xgb_mod <- xgb.train(
+  params = list(max_depth=4, eta=0.05, subsample=0.8, colsample_bytree=0.8,
+                objective="binary:logistic", eval_metric="auc"),
+  data=xgb_mat, nrounds=200, verbose=0)
+
+xgb_imp <- xgb.importance(model=xgb_mod) |>
+  as_tibble() |> rename(variable=Feature, imp=Gain) |> arrange(desc(imp))
+vars_xgb <- xgb_imp |> slice_head(n=k_optimo) |> pull(variable)
+
+ggplot(xgb_imp |> slice_head(n=min(25,nrow(xgb_imp))),
+       aes(reorder(variable,imp), imp, fill=imp)) +
+  geom_col(width=0.7, color="white") +
+  geom_hline(yintercept=xgb_imp$imp[k_optimo],
+             linetype="dashed", color="#e74c3c", linewidth=0.8) +
+  scale_fill_gradient(low="#fad7a0", high="#ca6f1e", guide="none") +
+  coord_flip() +
+  scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title    = sprintf("XGBoost — %d variables, k seleccionadas: %d",
+                         nrow(xgb_imp), k_optimo),
+     subtitle = sprintf("Línea roja: corte k_comun = %d", k_optimo),
+     x=NULL, y="Gain") +
+  theme(axis.text.y=element_text(size=8))
+
+# Evalúa SVM con features XGBoost — CV-5 sobre Train
+res_xgb <- eval_svm(vars_xgb, "XGBoost")
+```
+- **Gain (XGBoost):** reducción promedio de impureza que aporta una variable en
+  los nodos donde es utilizada para dividir, normalizada sobre todos los árboles.
+  Mayor Gain = mayor contribución a la capacidad predictiva del ensemble.
+- `complain_1` concentra prácticamente todo el Gain (~0.87), confirmando el patrón
+  observado en Fisher J y RF: una variable domina de forma casi exclusiva.
+  `age` y `numofproducts` retienen Gain visible (~0.08 y ~0.05); las 14 restantes
+  presentan Gain cercano a cero.
+- La **línea roja punteada** marca el corte `k_optimo = 6`: se seleccionan
+  `complain_1`, `age`, `numofproducts`, `isactivemember_1`, `balance` y
+  `geography_Germany`, aunque estas últimas tres aportan Gain marginal.
+
+
+
+### Selector 7 — Mutual Information
+
+```{r sel-mi}
+
+X_tr_disc <- discretize(X_tr_norm)
+y_tr_int  <- as.integer(y_tr) - 1L
+mi_scores <- setNames(map_dbl(names(X_tr_disc), \(v)
+  mutinformation(X_tr_disc[[v]], y_tr_int)), names(X_tr_disc))
+mi_df     <- tibble(variable=names(mi_scores), mi=mi_scores) |> arrange(desc(mi))
+vars_mi   <- mi_df |> slice_head(n=k_optimo) |> pull(variable)
+
+ggplot(mi_df |> slice_head(n=min(25,nrow(mi_df))),
+       aes(reorder(variable,mi), mi, fill=mi)) +
+  geom_col(width=0.7, color="white") +
+  geom_hline(yintercept=mi_df$mi[k_optimo],
+             linetype="dashed", color="#e74c3c", linewidth=0.8) +
+  scale_fill_gradient(low="#a9dfbf", high="#1e8449", guide="none") +
+  coord_flip() +
+  scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title = sprintf("Mutual Information — %d variables, k seleccionadas: %d",
+                         nrow(mi_df), k_optimo),
+     subtitle = sprintf("Línea roja: corte k_comun = %d", k_optimo),
+     x=NULL, y="I(X;Y)") +
+  theme(axis.text.y=element_text(size=8))
+
+# Evalúa SVM con features Mutual Information — CV-5 sobre Train
+res_mi <- eval_svm(vars_mi, "Mutual Information")
+
+```
+- **$I(X;Y)$ (Mutual Information):** cuánta información comparte una variable con
+  la clase objetivo, sin asumir linealidad. $I(X;Y) = 0$ indica independencia total;
+  mayor valor indica mayor dependencia estadística con `exited`.
+- `complain_1` concentra casi toda la información mutua ($I \approx 0.50$), mientras
+  `numofproducts` y `age` retienen señal moderada (~0.07 y ~0.06). Las 14 variables
+  restantes presentan $I(X;Y)$ cercano a cero, confirmando independencia práctica
+  con la clase.
+- La **línea roja punteada** marca el corte `k_optimo = 6`: se seleccionan
+  `complain_1`, `numofproducts`, `age`, `geography_Germany`, `isactivemember_1` y
+  `balance`. Las tres últimas quedan dentro del corte por el piso `k_comun = 6`,
+  no por información mutua propia relevante.
+---
+
+## Paso 3: Comparativa y selector ganador
+
+::: {.callout-important}
+**Principio de no contaminación:** toda la comparativa entre selectores se basa en métricas de validación cruzada CV-5 sobre Train. El conjunto Test permanece sellado hasta la Fase 5, donde se reportan las métricas finales del modelo ya construido. Esto garantiza que la elección del selector ganador no esté influenciada por los datos de evaluación final.
+:::
+
+```{r fs-comparativa}
+
+# Ponderación: AUC primaria, F1 secundaria, Kappa terciaria — Accuracy excluida por desbalance
+W_AUC <- 0.50; W_F1 <- 0.35; W_KAPPA <- 0.15
+
+comp_fs <- bind_rows(res_fisher, res_sfs, res_bb, res_rf,
+                     res_lasso, res_xgb, res_mi) |>
+  mutate(Score = round(W_AUC*AUC_cv + W_F1*F1_cv + W_KAPPA*Kappa_cv, 4)) |>
+  arrange(desc(Score))
+
+comp_fs |> select(Selector, k, AUC_cv, F1_cv, Kappa_cv, Score) |>
+  kbl(caption=sprintf("Comparativa — k=%d | Score = 0.50·AUC + 0.35·F1 + 0.15·Kappa | CV-5 sobre Train",k_optimo),
+      col.names=c("Selector","k","AUC-ROC CV","F1 CV","Kappa CV","Score ponderado")) |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE, font_size=12) |>
+  row_spec(1, bold=TRUE, background="#d5f5e3")
+
+```
+<br>
+
+Las métricas reportadas son promedios de validación cruzada de 5 pliegues sobre Train,
+sin ninguna intervención del conjunto Test. **Random Forest** es el selector ganador
+por una razón concreta: obtiene el mayor AUC-ROC CV (0.9994), lo que se traduce en
+el Score ponderado más alto (0.9979).
+
+- **AUC-ROC CV** actúa como criterio de desempate efectivo, F1 CV (0.9967) y
+  Kappa CV (0.9959) son idénticos en todos los selectores, por lo que la diferencia
+  en Score ponderado descansa exclusivamente en el AUC.
+- **Margen sobre los siguientes:** Lasso L1, XGBoost y Mutual Information alcanzan
+  Score 0.9979 con AUC 0.9993, mientras Fisher J y Branch & Bound quedan en 0.9977
+  y SFS en 0.9976 con k=4.
+- **Interpretación:** la diferencia es estrecha pero consistente, Random Forest
+  captura mayor separabilidad global entre Churn y Retenido sobre Train gracias a
+  su evaluación multivariada mediante permutación out-of-bag, lo que le otorga
+  la ventaja de una décima en AUC que define el ganador.
+
+```{r fs-plots, fig.width=12, fig.height=6}
+
+mk_bar <- function(df, y_var, titulo, ganador=NULL) {
+  p <- ggplot(df, aes(reorder(Selector,.data[[y_var]]), .data[[y_var]], fill=Selector)) +
+    geom_col(width=0.6, show.legend=FALSE) +
+    geom_text(aes(label=round(.data[[y_var]],4)), hjust=-0.1, size=4) +
+    coord_flip() + scale_fill_brewer(palette="Set2") +
+    scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+    labs(title=titulo,
+         subtitle=if(!is.null(ganador)) paste("Mayor es mejor  |  ★ Ganador:", ganador) else "Mayor es mejor",
+         x=NULL, y=y_var) +
+    theme(plot.title    = element_text(size=9.5, face="bold"),
+          plot.subtitle = element_text(size=7.5))
+  p
+}
+
+ganador_sel <- comp_fs$Selector[1]
+
+grid.arrange(
+  mk_bar(comp_fs, "AUC_cv", "AUC-ROC CV-5 Train"),
+  mk_bar(comp_fs, "F1_cv",  "F1-Score CV-5 Train"),
+  mk_bar(comp_fs, "Score",  "Score Ponderado\n(0.50·AUC + 0.35·F1 + 0.15·Kappa)",
+         ganador=ganador_sel),
+  ncol=3,
+  top=grid::textGrob("Comparativa de Selectores — Métricas CV-5 sobre Train",
+                     gp=grid::gpar(fontface="bold", fontsize=13))
+)
+
+```
+
+```{r fs-ganador}
+
+sel_names <- c("Fisher J","SFS","Branch & Bound","Random Forest",
+               "Lasso L1","XGBoost","Mutual Information")
+sel_vars  <- list(vars_fisher, vars_sfs, vars_bb, vars_rf,
+                  vars_lasso, vars_xgb, vars_mi)
+
+ganador_sel   <- comp_fs$Selector[1]
+vars_selected <- sel_vars[[match(ganador_sel, sel_names)]]
+
+cat(sprintf("✔ Ganador: %s | k=%d | AUC CV=%.4f | F1 CV=%.4f\n  Features: %s\n",
+            ganador_sel, length(vars_selected),
+            comp_fs$AUC_cv[1], comp_fs$F1_cv[1],
+            paste(vars_selected, collapse=", ")))
+```
+<br>
+
+- **Selector ganador:** Random Forest y sostenido por AUC-ROC CV, determinado por mayor Score ponderado (0.9979)
+  en CV-5 sobre Train.
+- **k=6:** `complain_1`, `numofproducts`, `age`, `balance`, `isactivemember_1`,
+  `creditscore` — subconjunto que avanza a la Fase 4.
+- **AUC CV=0.9994 | F1 CV=0.9967:** métricas promedio sobre los 5 pliegues de
+  Train exclusivamente, sin intervención de Test.
+
+::: {.callout-tip}
+**Ganador: `r ganador_sel`** — k=6, SVM evaluador (C=1, σ=0.1), CV-5 estratificada
+sobre Train. Las 6 variables seleccionadas combinan la señal dominante de
+`complain_1` con variables de perfil financiero y comportamental (`age`, `balance`,
+`numofproducts`, `isactivemember_1`, `creditscore`), proveyendo al SVM RBF de
+un espacio de features suficientemente rico para explotar interacciones no lineales
+en la Fase 4.
+:::
+
+## Grafo de relevancia: selector ganador
+
+```{r grafo, fig.width=10, fig.height=7}
+
+edges_g <- data.frame(from="exited", to=vars_selected, weight=fisher_scores[vars_selected])
+g_rel   <- graph_from_data_frame(edges_g, directed=FALSE,
+                                  vertices=data.frame(name=c("exited",vars_selected)))
+
+abbrevs <- c(
+  complain_1="QJA", satisfaction_score="SAT", card_type_GOLD="CGO",
+  hascreditcard="TDC", complain="QJA", age="AGE",
+  isactivemember="ACT", isactivemember1="ACT",
+  numofproducts="NPR", balance="BAL",
+  geographyGermany="ALE", geographySpain="ESP",
+  genderMale="GEN", point_earned="PTS",
+  tenure="TEN", creditscore="CRD",
+  hascreditcard1="TDC", estimatedsalary="SAL"
+)
+
+V(g_rel)$color       <- ifelse(V(g_rel)$name=="exited","#27ae60","#6c3483")
+V(g_rel)$size        <- ifelse(V(g_rel)$name=="exited", 48,
+                                scales::rescale(fisher_scores[vars_selected], to=c(28,42)))
+V(g_rel)$label       <- sapply(V(g_rel)$name, \(x)
+                          if(x=="exited") "EXT"
+                          else if(x %in% names(abbrevs)) abbrevs[[x]]
+                          else toupper(substr(x,1,3)))
+V(g_rel)$label.color <- "white"
+V(g_rel)$label.cex   <- 1.1
+V(g_rel)$label.font  <- 2
+V(g_rel)$frame.color <- NA
+E(g_rel)$width       <- scales::rescale(log1p(edges_g$weight), to=c(1,9))
+E(g_rel)$color       <- "#95a5a6"
+E(g_rel)$label       <- round(edges_g$weight, 3)
+E(g_rel)$label.cex   <- 0.75
+E(g_rel)$label.color <- "#2c3e50"
+
+plot(g_rel, layout=layout_in_circle(g_rel), margin=0.18,
+     main=paste0("Grafo de Relevancia — Selector ganador: ", ganador_sel),
+     sub="Tamano nodo ~ Fisher J  |  Grosor arista ~ poder discriminante  |  Ver diccionario de acronimos abajo")
+
+
+```
+<br>
+
+| Acrónimo | Variable | Descripción |
+|---|---|---|
+| `EXT` | `exited` | Variable objetivo — Churn |
+| `QJA` | `complain_1` | Cliente realizó una queja |
+| `NPR` | `numofproducts` | Número de productos contratados |
+| `AGE` | `age` | Edad del cliente en años |
+| `BAL` | `balance` | Saldo en cuenta |
+| `ISA` | `isactivemember_1` | Cliente miembro activo |
+| `CRD` | `creditscore` | Score crediticio |
+
+: Diccionario de acrónimos — Grafo de Relevancia
+
+# Fase 4: Modelamiento SVM con Kernel RBF
+
+## Preparación final
+
+```{r prep-final}
+
+vars_in       <- intersect(vars_selected, names(X_tr_norm))
+X_tr          <- X_tr_norm[, vars_in, drop=FALSE]
+X_te          <- X_te_norm[, vars_in, drop=FALSE]
+vars_selected <- names(X_tr)
+
+cat(sprintf("Features → SVM: %d | %s\n", ncol(X_tr), paste(vars_selected,collapse=", ")))
+
+```
+Confirmación del input final al SVM: features seleccionadas por el selector ganador, 
+ya normalizadas en $[0,1]$, listas para entrenamiento y evaluación.
+
+## Tuning (Grid Search + CV 5-fold)
+
+```{r tuning}
+
+ctrl     <- trainControl(method="cv", number=5, classProbs=TRUE,
+                         summaryFunction=twoClassSummary, savePredictions="final")
+grid_svm <- expand.grid(C=c(0.1,0.5,1,5,10), sigma=c(0.01,0.05,0.1,0.5))
+
+set.seed(42)
+svm_tuned <- train(x=X_tr, y=y_tr, method="svmRadial",
+                   trControl=ctrl, tuneGrid=grid_svm, metric="ROC")
+cat(sprintf("Mejor C: %s | Mejor sigma: %s\n",
+            svm_tuned$bestTune$C, svm_tuned$bestTune$sigma))
+```
+- **C (10):** parámetro de penalización alto — el modelo minimiza errores de
+  clasificación en Train a costa de un margen más estrecho, priorizando precisión
+  sobre generalización.
+- **sigma (0.05):** ancho del kernel RBF pequeño — produce una frontera suave,
+  poco sensible a puntos individuales.
+  
+  
+**Tuning de hiperparámetros:** a diferencia de los pesos del modelo, que se aprenden
+automáticamente durante el entrenamiento, los hiperparámetros deben definirse antes
+de entrenar. En SVM los dos críticos son C y sigma (γ). El tuning sistematiza su
+búsqueda mediante Grid Search, evaluando todas las combinaciones de una grilla
+predefinida, usando CV-5 como árbitro, de modo que la elección óptima descanse en
+evidencia interna de Train y no contamine el conjunto de prueba.
+
+<br>
+
+```{r tune-plot, fig.width=12, fig.height=6}
+
+svm_tuned$results |>
+  mutate(sigma=factor(sigma)) |>
+  ggplot(aes(C, ROC, color=sigma, group=sigma)) +
+  geom_line(linewidth=1.3) +
+  geom_point(size=3) +
+  # Destacar combinación ganadora
+  geom_point(data=svm_tuned$results |>
+               filter(C==svm_tuned$bestTune$C, sigma==svm_tuned$bestTune$sigma),
+             aes(C, ROC), color="#f1c40f", size=5, shape=8, stroke=1.5) +
+  scale_color_manual(values=c("0.01"="#6c3483","0.05"="#27ae60",
+                               "0.1"="#1a5276","0.5"="#2ecc71"),
+                     name="Sigma") +
+  scale_x_continuous(breaks=c(0.1,0.5,1,5,10)) +
+  labs(title   = "Superficie AUC-ROC — Grid Search SVM RBF",
+       subtitle = paste0("★ Óptimo: C=", svm_tuned$bestTune$C,
+                         " | sigma=", svm_tuned$bestTune$sigma),
+       x="Cost (C)", y="ROC (Cross-Validation)") +
+  theme(legend.position="top")
+```
+
+- **sigma=0.05 con C=10** alcanza el AUC máximo (≈0.9994) — frontera suave con
+  margen estrecho, priorizando clasificación correcta sobre generalización.
+- **sigma=0.5** degrada el rendimiento a medida que C aumenta, cayendo a ~0.9983
+  en C=10 — una frontera demasiado flexible pierde capacidad discriminante.
+- **sigma=0.1** alcanza su peak en C=1 y luego decrece, confirmando que valores
+  intermedios de ambos hiperparámetros no son óptimos para este dataset.
+- La variación total entre las 20 combinaciones es < 0.002, confirmando robustez
+  general del SVM, aunque la elección de sigma=0.05 con C alto es la que maximiza
+  el AUC en validación cruzada.
+- La estrella **★** marca la combinación ganadora — sigma=0.05 (verde claro) con
+  C=10, diferenciada visualmente de sigma=0.01 (morado), sigma=0.1 (azul) y
+  sigma=0.5 (verde oscuro). 
+
+## Kernel Lineal vs RBF: comparativa visual de lineas de decisión
+
+::: {.callout-note}
+Comparativa en escala original entre el kernel **lineal** (línea rígida) y el kernel 
+**RBF** (línea flexible). La línea negra muestra la frontera f=0 usando valores de 
+decisión numéricos — el kernel lineal no logra trazar línea visible porque no existe 
+separación lineal en este espacio, mientras el RBF captura la estructura no lineal del problema.
+:::
+
+```{r kernel-comparison, fig.width=11, fig.height=5}
+
+df_tr2_norm <- X_tr_norm[, c(v1,v2), drop=FALSE] |>
+  as.data.frame() |> mutate(exited=y_tr)
+
+svm_lin_viz <- svm(exited~., data=df_tr2_norm, kernel="linear",
+                   cost=1, decision.values=TRUE)
+svm_rbf_viz <- svm(exited~., data=df_tr2_norm, kernel="radial",
+                   cost=1, gamma=0.5, decision.values=TRUE)
+
+# Grid en espacio normalizado
+g2d_norm <- expand.grid(seq(0,1,length.out=200),
+                         seq(0,1,length.out=200)) |> setNames(c(v1,v2))
+
+# Reconvertir a escala original
+rng    <- pp_mm$ranges
+min_v1 <- rng[1,v1]; max_v1 <- rng[2,v1]
+min_v2 <- rng[1,v2]; max_v2 <- rng[2,v2]
+
+make_grid <- function(svm_mod, tipo) {
+  g2d_norm |>
+    mutate(pred     = predict(svm_mod, g2d_norm),
+           decision = as.numeric(attr(predict(svm_mod, g2d_norm,
+                                              decision.values=TRUE), "decision.values")),
+           !!v1    := .data[[v1]] * (max_v1-min_v1) + min_v1,
+           !!v2    := .data[[v2]] * (max_v2-min_v2) + min_v2,
+           tipo     = tipo)
+}
+
+df_grid_comp <- bind_rows(
+  make_grid(svm_lin_viz, "Kernel Lineal (línea rígida)"),
+  make_grid(svm_rbf_viz, "Kernel RBF (línea flexible)")) |>
+  mutate(tipo=factor(tipo, levels=c("Kernel Lineal (línea rígida)",
+                                    "Kernel RBF (línea flexible)")))
+
+df_pts_comp <- df_tr2 |>
+  tidyr::crossing(tipo=levels(df_grid_comp$tipo)) |>
+  mutate(tipo  =factor(tipo,   levels=levels(df_grid_comp$tipo)),
+         exited=factor(exited, levels=levels(y_tr)))
+
+ggplot(df_grid_comp) +
+  geom_tile(aes(.data[[v1]],.data[[v2]],fill=pred), alpha=0.25) +
+  geom_contour(aes(.data[[v1]],.data[[v2]],z=decision),
+               breaks=0, color="black", linewidth=1.3) +
+  geom_point(data=df_pts_comp, aes(.data[[v1]],.data[[v2]],color=exited,shape=exited),
+             size=0.9, alpha=0.5) +
+  facet_wrap(~tipo, ncol=2) +
+  scale_fill_manual(values=c(No="#4a235a",Yes="#1a6b3c"),
+                    labels=c(No="Retenido",Yes="Churn"), name="Región") +
+  scale_color_manual(values=c(No="#7d3c98",Yes="#27ae60"),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  scale_shape_manual(values=c(No=16,Yes=17),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  labs(title    = "Kernel Lineal vs RBF — Línea de Decisión",
+       subtitle = paste0("── Línea negra: frontera f=0 | ",v1," (x)  vs  ",v2," (y)\n",
+                         "El RBF adapta la línea a la geometría de los datos; el lineal la restringe a un hiperplano"),
+       x=v1, y=v2) +
+  theme(legend.position="bottom", strip.text=element_text(face="bold",size=11),
+        panel.grid=element_blank())
+```
+> El kernel lineal no logra separar las clases — la frontera rígida no captura 
+> la estructura no lineal del problema. El RBF delimita correctamente la zona 
+> de riesgo con la frontera en U observada.
+
+## Plot canónico: Línea, Márgenes y Vectores de Soporte
+
+::: {.callout-note}
+Visualización en PCA del modelo final tuneado (C=`r svm_tuned$bestTune$C`, σ=`r svm_tuned$bestTune$sigma`). Muestra la geometría SVM completa: frontera f=0, márgenes f=±1 y vectores de soporte sobre submuestra balanceada de Train.
+:::
+
+```{r svm-canonical, fig.width=9, fig.height=6}
+
+set.seed(42); n_sub <- 150
+PC_sub <- bind_rows(
+  PC_tr[sample(which(PC_tr$exited=="No"),  min(n_sub,sum(PC_tr$exited=="No"))),],
+  PC_tr[sample(which(PC_tr$exited=="Yes"), min(n_sub,sum(PC_tr$exited=="Yes"))),])
+
+svm_can     <- svm(exited~PC1+PC2, data=PC_sub, kernel="radial",
+                   cost=svm_tuned$bestTune$C, gamma=svm_tuned$bestTune$sigma)
+svm_can_raw <- svm(exited~PC1+PC2, data=PC_sub, kernel="radial",
+                   cost=svm_tuned$bestTune$C, gamma=svm_tuned$bestTune$sigma,
+                   decision.values=TRUE)
+
+grid_c <- expand.grid(
+  PC1=seq(min(PC_sub$PC1)-.5, max(PC_sub$PC1)+.5, length.out=300),
+  PC2=seq(min(PC_sub$PC2)-.5, max(PC_sub$PC2)+.5, length.out=300))
+grid_c$pred     <- predict(svm_can, newdata=grid_c)
+grid_c$decision <- as.numeric(attr(predict(svm_can_raw,newdata=grid_c,
+                                           decision.values=TRUE),"decision.values"))
+sv_can <- PC_sub[svm_can$index,]
+cat(sprintf("Vectores de soporte: %d/%d (%.1f%%)\n",
+            nrow(sv_can),nrow(PC_sub),nrow(sv_can)/nrow(PC_sub)*100))
+
+ggplot() +
+  geom_tile(data=grid_c, aes(PC1,PC2,fill=pred), alpha=0.22) +
+  geom_contour(data=grid_c, aes(PC1,PC2,z=decision),
+               breaks=0,      color="black", linewidth=1.1) +
+  geom_contour(data=grid_c, aes(PC1,PC2,z=decision),
+               breaks=c(-1,1),color="black", linewidth=0.55, linetype="dashed") +
+  geom_point(data=PC_sub, aes(PC1,PC2,color=exited,shape=exited), size=2.0, alpha=0.75) +
+  geom_point(data=sv_can, aes(PC1,PC2), shape=21, size=4.5, stroke=1.0,
+             color="black", fill=NA) +
+  scale_fill_manual(values=c(No="#4a235a",Yes="#1a6b3c"),
+                    labels=c(No="Retenido",Yes="Churn"), name="Región") +
+  scale_color_manual(values=c(No="#7d3c98",Yes="#27ae60"),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  scale_shape_manual(values=c(No=16,Yes=17),
+                     labels=c(No="Retenido",Yes="Churn"), name="Clase real") +
+  annotate("text", x=Inf, y=Inf,
+           label=paste0("C=",svm_tuned$bestTune$C," | σ=",svm_tuned$bestTune$sigma,
+                        " | SV=",nrow(sv_can)),
+           hjust=1.05, vjust=1.8, size=3.5, color="grey30", fontface="italic") +
+  labs(title    = "SVM — Línea de decisión, Márgenes y Vectores de Soporte (modelo tuneado)",
+       subtitle = paste0("── f=0 (frontera)  - - f=±1 (márgenes)  ○ Vectores de soporte\n",
+                         "Proyección PCA | C=",svm_tuned$bestTune$C,
+                         " | σ=",svm_tuned$bestTune$sigma),
+       x=paste0("PC1 (",var_exp[1],"%)"), y=paste0("PC2 (",var_exp[2],"%)")) +
+  theme(legend.position="bottom")
+```
+
+- **C=10:** margen estrecho — el modelo penaliza fuertemente los errores de
+  clasificación en Train, priorizando precisión sobre tolerancia a puntos mal
+  clasificados.
+- **σ=0.05:** frontera suave — poco sensible a puntos individuales, evitando
+  sobreajuste pese al C alto.
+- **SV=163:** vectores de soporte — puntos más cercanos a la frontera que la
+  definen. Un número menor que en configuraciones con C bajo es consistente con
+  un margen más estrecho que excluye más puntos de la banda de incertidumbre.
+- **Frontera f=0** (línea sólida): separa la zona morada de Retención de la
+  zona verde de Churn.
+- **Márgenes f=±1** (líneas punteadas): banda de incertidumbre — los puntos
+  dentro de esta banda son los vectores de soporte que sostienen la frontera.
+
+---
+
+# Fase 5: Evaluación y Predicciones
+
+## Predicciones y métricas
+
+```{r predict}
+
+pred_cls  <- predict(svm_tuned, newdata=X_te)
+pred_prob <- predict(svm_tuned, newdata=X_te, type="prob")[,"Yes"]
+roc_obj   <- roc(y_te, pred_prob, levels=c("No","Yes"), direction="<")
+auc_val   <- auc(roc_obj)
+cm        <- confusionMatrix(pred_cls, y_te, positive="Yes")
+print(cm)
+```
+**La matriz confirma un modelo de alto rendimiento sobre 2499 observaciones de Test**
+
+- **1987 TN:** retenidos correctamente clasificados.
+- **508 TP:** clientes churn correctamente detectados.
+- **3 FP:** retenidos clasificados como churn — costo bajo (retención innecesaria).
+- **1 FN:** churn no detectado — costo alto en negocio (cliente perdido sin intervención).
+
+**Métricas clave:**
+
+- **Accuracy (0.9984):** 99.8% de clasificaciones correctas.
+- **Sensitivity/Recall (0.9980):** detecta el 99.8% de los churn reales — crítico en retención.
+- **Specificity (0.9985):** clasifica correctamente el 99.8% de los retenidos.
+- **Kappa (0.9951):** acuerdo casi perfecto corregido por azar — robusto bajo desbalance.
+- **Balanced Accuracy (0.9983):** confirma separación casi perfecta entre clases.
+
+**`Positive Class: Yes`** aparece porque en `confusionMatrix()` se especificó 
+`positive="Yes"` — le indica a caret que "Yes" (Churn) es la clase de interés, 
+orientando Sensitivity y Specificity hacia la detección de churn y no de retención.
+
+
+## Matriz de confusión
+
+```{r conf-matrix, fig.width=10, fig.height=5}
+
+as.data.frame(cm$table) |>
+  rename(Predicho=Prediction, Real=Reference) |>
+  mutate(correcto=(Predicho==Real),
+         etiqueta=paste0(Freq,"\n(",round(Freq/sum(Freq)*100,1),"%)")) |>
+  ggplot(aes(Real,Predicho,fill=correcto)) +
+  geom_tile(color="white", linewidth=1.2) +
+  geom_text(aes(label=etiqueta), fontface="bold", size=5.5) +
+  scale_fill_manual(values=c("TRUE"="#6c3483","FALSE"="#1e8449"),
+                    labels=c("TRUE"="Correcto","FALSE"="Error"), name=NULL) +
+  scale_x_discrete(position="top") +
+  labs(title    = "Matriz de Confusión — SVM RBF",
+       subtitle = paste0("Accuracy:",round(cm$overall["Accuracy"],4),
+                         " | F1:",round(cm$byClass["F1"],4),
+                         " | AUC:",round(auc_val,4)),
+       x="Clase Real", y="Clase Predicha") +
+  theme(legend.position="bottom", axis.text=element_text(size=12,face="bold"),
+        panel.grid=element_blank())
+```
+
+## Métricas consolidadas
+
+```{r metrics-table}
+
+met_nom <- c("Accuracy","Precisión","Recall","F1-Score","Especificidad","Kappa")
+tibble(Métrica=met_nom,
+       Valor=round(c(cm$overall["Accuracy"], cm$byClass["Precision"],
+                     cm$byClass["Sensitivity"], cm$byClass["F1"],
+                     cm$byClass["Specificity"], cm$overall["Kappa"]),4)) |>
+  kbl(caption="Métricas — SVM RBF en Test") |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE, font_size=13) |>
+  row_spec(which(met_nom %in% c("F1-Score","Recall")), bold=TRUE, color="#c0392b")
+```
+- **Recall (0.9980):** detecta casi todos los churns reales, métrica crítica en retención.
+- **F1 (0.9961):** balance óptimo entre precisión y detección bajo desbalance de clases.
+
+
+## Curvas ROC y Precision-Recall
+
+```{r roc-pr, fig.width=12, fig.height=5}
+
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+
+p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_area(fill = "#1565C0", alpha = 0.20) +
+  geom_line(color = "#1565C0", linewidth = 1.6) +
+  geom_abline(linetype = "dashed", color = "grey55", linewidth = 0.8) +
+  annotate("text", x = 0.60, y = 0.22,
+           label = paste0("AUC-ROC = ", round(auc_val, 4)),
+           size = 5, fontface = "bold", color = "#0D47A1") +
+  labs(title = "Curva ROC",
+       x = "Tasa Falsos Positivos", y = "Sensibilidad") +
+  coord_equal()
+
+pred_rocr <- prediction(pred_prob, ifelse(y_te == "Yes", 1, 0))
+perf_pr   <- performance(pred_rocr, "prec", "rec")
+pr_df     <- data.frame(recall    = perf_pr@x.values[[1]],
+                        precision = perf_pr@y.values[[1]]) |>
+             filter(!is.nan(precision))
+aucpr_val <- abs(sum(diff(pr_df$recall) *
+                     (head(pr_df$precision, -1) + tail(pr_df$precision, -1))) / 2)
+
+p_pr <- ggplot(pr_df, aes(recall, precision)) +
+  geom_area(fill = "#E65100", alpha = 0.20) +
+  geom_line(color = "#E65100", linewidth = 1.6) +
+  geom_hline(yintercept = mean(y_te == "Yes"),
+             linetype = "dashed", color = "grey55", linewidth = 0.8) +
+  annotate("text", x = 0.30, y = 0.22,
+           label = paste0("AUC-PR = ", round(aucpr_val, 4)),
+           size = 5, fontface = "bold", color = "#BF360C") +
+  labs(title    = "Curva Precision-Recall",
+       subtitle = "Más informativa bajo desbalance",
+       x = "Recall", y = "Precisión") +
+  xlim(0, 1) + ylim(0, 1)
+
+grid.arrange(p_roc, p_pr, ncol = 2,
+             top = grid::textGrob(
+               "Curvas ROC y Precision-Recall — SVM RBF",
+               gp = grid::gpar(fontface = "bold", fontsize = 13)))
+```
+**Curvas ROC y Precision-Recall**
+
+- **Curva ROC (AUC=0.998):** el modelo separa Churn de Retenido casi perfectamente, 
+  la curva abraza la esquina superior izquierda, lejos de la diagonal (azar puro).
+- **Curva PR (AUC=0.9945):** más exigente bajo desbalance, precisión se mantiene 
+  cercana a 1.0 en todo el rango de recall, confirmando que el modelo detecta churn 
+  sin generar falsos positivos relevantes.
+  
+---
+
+# Fase 6: Puesta en Operación
+
+## Generación de datos nuevos
+
+```{r new-data}
+
+set.seed(99); n_new <- 2000
+
+new_data <- tibble(
+  creditscore        = pmax(300,pmin(850,round(rnorm(n_new,mean(churn$creditscore),sd(churn$creditscore))))),
+  age                = pmax(18,pmin(92,round(rnorm(n_new,mean(churn$age),sd(churn$age))))),
+  tenure             = round(runif(n_new,0,10)),
+  balance            = pmax(0,rnorm(n_new,mean(churn$balance),sd(churn$balance))),
+  numofproducts      = sample(1:4,n_new,replace=TRUE,prob=prop.table(table(churn$numofproducts))),
+  estimatedsalary    = pmax(0,rnorm(n_new,mean(churn$estimatedsalary),sd(churn$estimatedsalary))),
+  satisfaction_score = sample(1:5,n_new,replace=TRUE),
+  point_earned       = pmax(0,round(rnorm(n_new,mean(churn$point_earned),sd(churn$point_earned)))),
+  geography   = factor(sample(c("France","Germany","Spain"),n_new,replace=TRUE,
+                               prob=prop.table(table(churn$geography))),
+                       levels=levels(churn_model$geography)),
+  gender      = factor(sample(c("Female","Male"),n_new,replace=TRUE,
+                               prob=prop.table(table(churn$gender))),
+                       levels=levels(churn_model$gender)),
+  isactivemember = factor(sample(0:1,n_new,replace=TRUE,
+                                  prob=prop.table(table(churn$isactivemember))),
+                          levels=levels(churn_model$isactivemember)),
+  complain    = factor(sample(0:1,n_new,replace=TRUE,
+                               prob=prop.table(table(churn$complain))),
+                       levels=levels(churn_model$complain))
+)
+
+new_dummies <- model.matrix(~geography+gender+isactivemember+complain-1, data=new_data) |>
+  as.data.frame()
+names(new_dummies) <- stringr::str_replace_all(names(new_dummies),"\\.", "_")
+
+new_pool <- bind_cols(select(new_data, any_of(NUM_COLS)), new_dummies)
+for (col in setdiff(names(X_clean), names(new_pool))) new_pool[[col]] <- 0
+
+new_Xsc  <- predict(pp_mm, new_pool[,names(X_clean),drop=FALSE])[,vars_selected,drop=FALSE]
+new_cls  <- predict(svm_tuned, newdata=new_Xsc)
+new_prob <- predict(svm_tuned, newdata=new_Xsc, type="prob")[,"Yes"]
+
+cat(sprintf("Tasa churn predicha: %.4f (%d/%d)\n",
+            mean(new_cls=="Yes"), sum(new_cls=="Yes"), n_new))
+
+```
+La tasa de churn predicha es 0% porque `complain_1` domina el modelo. Si los datos simulados no replican la proporción real de quejas del dataset original, el SVM clasifica todos los clientes nuevos como Retenidos.
+
+## Comparativa distribuciones de probabilidad
+
+```{r compare-dist, fig.width=11, fig.height=6}
+
+tramos <- c(0, 0.10, 0.30, 0.50, 0.75, 1.0)
+labs_t <- c("Muy bajo\n(<10%)", "Bajo\n(10-30%)", "Moderado\n(30-50%)",
+             "Alto\n(50-75%)", "Crítico\n(>75%)")
+
+df_comp <- bind_rows(
+  tibble(prob=pred_prob, conjunto="Test original"),
+  tibble(prob=new_prob,  conjunto="Datos nuevos (n=2000)")
+) |> mutate(
+  conjunto = factor(conjunto, levels=c("Test original","Datos nuevos (n=2000)")),
+  tramo    = cut(prob, breaks=tramos, labels=labs_t, include.lowest=TRUE)
+)
+
+p1 <- ggplot(df_comp, aes(prob, color=conjunto, fill=conjunto)) +
+  geom_density(alpha=0.2, linewidth=0.9) +
+  geom_vline(xintercept=0.5, linetype="dashed", color="#e74c3c", linewidth=0.9) +
+  scale_color_manual(values=c("#2980b9","#8e44ad")) +
+  scale_fill_manual(values =c("#2980b9","#8e44ad")) +
+  annotate("text", x=0.62, y=Inf, label="Zona\nriesgo", vjust=1.5,
+           color="#e74c3c", fontface="bold", size=3.5) +
+  labs(title="Densidad P(Churn)", x="P(Churn)", y="Densidad", color=NULL, fill=NULL) +
+  theme(legend.position="bottom")
+
+df_tramos <- df_comp |>
+  count(conjunto, tramo) |>
+  group_by(conjunto) |>
+  mutate(pct=round(n/sum(n)*100,1))
+
+col_tramos <- c("Muy bajo\n(<10%)"="#2ecc71","Bajo\n(10-30%)"="#f1c40f",
+                "Moderado\n(30-50%)"="#e67e22","Alto\n(50-75%)"="#e74c3c",
+                "Crítico\n(>75%)"="#7b241c")
+
+p2 <- ggplot(df_tramos, aes(tramo, pct, fill=tramo)) +
+  geom_col(width=0.65, show.legend=FALSE) +
+  geom_text(aes(label=paste0(pct,"%\n(n=",n,")")), vjust=-0.3, size=3, fontface="bold") +
+  facet_wrap(~conjunto, ncol=2) +
+  scale_fill_manual(values=col_tramos) +
+  scale_y_continuous(expand=expansion(mult=c(0,0.25))) +
+  labs(title="Distribución por tramo de riesgo", x=NULL, y="% Clientes") +
+  theme(axis.text.x=element_text(size=8))
+
+grid.arrange(p1, p2, nrow=2, heights=c(1,1.2))
+
+```
+
+**Densidad P(Churn):**
+
+- **Test original (azul):** distribución bimodal — masa concentrada cerca de 0 
+  (retenidos) y un pico secundario cerca de 1 (churn). Refleja la separación real 
+  del modelo.
+- **Datos nuevos (morado):** toda la masa colapsada en 0 — el modelo asigna 
+  P(Churn)≈0 a todos los clientes simulados por ausencia de quejas.
+
+**Distribución por tramo de riesgo:**
+
+- **Test original:** 79.6% riesgo muy bajo y 20.4% crítico, consistente con la 
+  tasa de churn real del dataset (~20%).
+- **Datos nuevos:** 100% riesgo muy bajo, consecuencia directa de no replicar 
+  la proporción de quejas del dataset original.
+
+<br>
+
+## Evaluación formal sobre datos nuevos (etiquetas simuladas)
+
+::: {.callout-note}
+Los datos nuevos no tienen etiqueta real. Se simulan etiquetas consistentes con
+las probabilidades condicionales observadas en Train: `P(Churn | queja)` y
+`P(Churn | sin queja)`, replicando la estructura causal dominante del dataset.
+:::
+
+```{r new-data-eval}
+
+# Probabilidades condicionales estimadas desde Train
+p_churn_con    <- mean(y_tr[X_tr_norm$complain_1 == 1] == "Yes")
+p_churn_sin    <- mean(y_tr[X_tr_norm$complain_1 == 0] == "Yes")
+
+# complain_1 desde la matriz ya encodeada (no desde new_data crudo)
+complain_new <- new_Xsc$complain_1   # 0/1 normalizado → sigue siendo 0 o 1 en MinMax
+
+set.seed(42)
+y_new_sim <- factor(
+  ifelse(complain_new == 1,
+         rbinom(n_new, 1, p_churn_con),
+         rbinom(n_new, 1, p_churn_sin)),
+  levels = c(0, 1), labels = c("No", "Yes")
+)
+
+# Verificar que hay ambas clases antes de calcular métricas
+stopifnot("Sin casos positivos simulados — revisar proporción complain" = any(y_new_sim == "Yes"))
+
+new_cls_eval  <- predict(svm_tuned, newdata = new_Xsc)
+new_prob_eval <- predict(svm_tuned, newdata = new_Xsc, type = "prob")[, "Yes"]
+
+roc_new <- roc(y_new_sim, new_prob_eval, levels = c("No", "Yes"), direction = "<")
+auc_new <- auc(roc_new)
+cm_new  <- confusionMatrix(new_cls_eval, y_new_sim, positive = "Yes")
+
+# Tabla comparativa
+tibble(
+  Métrica         = c("AUC-ROC", "F1-Score", "Recall", "Precisión", "Kappa"),
+  `Test original` = round(c(auc_val,
+                             cm$byClass["F1"],
+                             cm$byClass["Sensitivity"],
+                             cm$byClass["Precision"],
+                             cm$overall["Kappa"]), 4),
+  `Datos nuevos`  = round(c(as.numeric(auc_new),
+                             cm_new$byClass["F1"],
+                             cm_new$byClass["Sensitivity"],
+                             cm_new$byClass["Precision"],
+                             cm_new$overall["Kappa"]), 4)
+) |>
+  kbl(caption = "Métricas comparativas — Test original vs Datos nuevos (etiquetas simuladas)") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE, font_size = 13) |>
+  row_spec(1:2, bold = TRUE, background = "#eaf2ff") |>
+  footnote(
+    general = paste0(
+      "P(Churn | queja) = ", round(p_churn_con, 3),
+      " | P(Churn | sin queja) = ", round(p_churn_sin, 3),
+      " — estimadas desde Train. Etiquetas no observadas."
+    ),
+    general_title = "Nota:"
+  )
+```
+**Interpretación:** F1, Recall, Precisión y Kappa son no computables sobre datos 
+nuevos porque `P(Churn | sin queja) = 0.001` en Train genera etiquetas simuladas 
+con masa positiva insuficiente — no hay denominador para calcularlas. 
+**AUC-ROC = 0.8829 es la única métrica válida:** no requiere balance de clases ni 
+umbral fijo, y su valor confirma capacidad discriminante real. La caída desde 0.9980 
+refleja la diferencia distribucional entre datos reales y sintéticos, no deterioro 
+del modelo.
+
+::: {.callout-important}
+F1, Recall y Kappa son interpretables únicamente sobre Test original. El AUC-ROC 
+sobre datos nuevos es el indicador correcto de generalización.
+:::
+
+
+## Segmentación por riesgo
+
+```{r segmentation}
+
+results_orig <- tibble(
+  prob_churn = pred_prob,
+  pred_churn = pred_cls
+) |>
+  mutate(
+    risk_level = factor(case_when(
+      pred_prob >= 0.75 ~ "Crítico (>75%)",
+      pred_prob >= 0.50 ~ "Alto (50-75%)",
+      pred_prob >= 0.30 ~ "Moderado (30-50%)",
+      TRUE              ~ "Bajo (<30%)"),
+      levels = c("Crítico (>75%)", "Alto (50-75%)", "Moderado (30-50%)", "Bajo (<30%)"))
+  )
+
+results_orig |> count(risk_level) |> mutate(pct = round(n / sum(n) * 100, 1)) |>
+  kbl(caption = "Distribución por nivel de riesgo — Dataset original (Test)",
+      col.names = c("Nivel", "N° Clientes", "% Total")) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE, font_size = 13)
+
+```
+**La segmentación sobre Test refleja la distribución real predicha por el SVM:**
+
+- **Crítico (>75%):** 511 clientes (20.4%), consistente con la tasa de churn
+  real del dataset (~20%).
+- **Bajo (<30%):** 1988 clientes (79.6%), clientes sin señal de abandono.
+- **Niveles intermedios ausentes:** el modelo separa las clases con alta certeza,
+  asignando probabilidades cercanas a 0 o a 1 sin ambigüedad relevante, coherente
+  con el AUC-ROC de 0.9994 obtenido en validación cruzada.
+
+
+```{r risk-plot, fig.width=8, fig.height=4}
+
+risk_col <- c("Crítico (>75%)"  = "#e74c3c", "Alto (50-75%)"     = "#e67e22",
+              "Moderado (30-50%)" = "#f1c40f", "Bajo (<30%)"      = "#2ecc71")
+
+results_orig |> count(risk_level) |> mutate(pct = round(n / sum(n) * 100, 1)) |>
+  ggplot(aes(risk_level, n, fill = risk_level)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "\n(", pct, "%)")), vjust = -0.3, fontface = "bold", size = 4) +
+  scale_fill_manual(values = risk_col) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title    = "Segmentación de Riesgo — Dataset original (Test)",
+       subtitle = "Distribución de clientes según probabilidad de churn predicha por SVM",
+       x = NULL, y = "N° Clientes")
+
+```
+
+## Marco de acciones TIC
+
+La segmentación sobre el conjunto Test refleja la distribución real de riesgo
+predicha por el SVM sobre datos no vistos durante el entrenamiento, constituyendo
+la base operacional para intervención proactiva.
+
+| Segmento | P(Churn) | Acción | Equipo | Canal |
+|---|---|---|---|---|
+| 🔴 Crítico | >75% | Llamada + oferta retención | CRM / Ejecutivos Senior | Telefónico + Email |
+| 🟠 Alto | 50–75% | Campaña digital segmentada | Marketing Digital | Email + App |
+| 🟡 Moderado | 30–50% | Programa fidelización | Customer Success | App + SMS |
+| 🟢 Bajo | <30% | Nurturing + cross-sell | Marketing Automation | Email |
+
+: Framework de intervención {tbl-colwidths="[15,12,35,23,15]"} 
+
+
+# Resumen Ejecutivo
+
+```{r summary-final, echo=FALSE}
+
+tibble(
+  Componente=c("Dataset","Variable objetivo",
+               "Features post-encoding (m)","Clean: NZV+constantes",
+               "Clean: correladas (|r|≥0.90)","Features limpias (q)",
+               "Normalización","Selectores evaluados","k común",
+               "Selector ganador","Variables seleccionadas (p)",
+               "Algoritmo","Kernel","Mejor C","Mejor sigma",
+               "AUC-ROC Test","F1-Score Test","Datos nuevos","Tasa churn predicha"),
+  Resultado=c(
+    paste0(nrow(churn)," × ",ncol(churn)),
+    "Exited (No=Retenido, Yes=Churn)",
+    as.character(ncol(X_all)),
+    as.character(length(nzv_idx)+length(vars_cte)),
+    as.character(length(vars_removed_corr)),
+    as.character(ncol(X_tr_clean)),
+    "MinMax [0,1] — parámetros de Train",
+    "Fisher J | SFS | B&B | RF | Lasso | XGB | MI",
+    as.character(k_optimo), ganador_sel,
+    paste0(length(vars_selected),": ",paste(vars_selected,collapse=" + ")),
+    "SVM (e1071/caret)","RBF",
+    as.character(svm_tuned$bestTune$C),
+    as.character(svm_tuned$bestTune$sigma),
+    as.character(round(auc_val,4)),
+    as.character(round(cm$byClass["F1"],4)),
+    as.character(n_new),
+    as.character(round(mean(new_cls=="Yes"),4))
+  )
+) |>
+  kbl(caption="Resumen ejecutivo") |>
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),
+                full_width=FALSE, font_size=12) |>
+  row_spec(c(16,17), bold=TRUE, background="#eaf2ff")
+```
+
+---
+
+# Conclusión
+
+El pipeline completo, desde EDA hasta puesta en operación, produjo un SVM RBF con
+AUC-ROC de 0.9980 y F1 de 0.9961 sobre Test, métricas que confirman separabilidad
+casi perfecta entre clientes Churn y Retenidos. Sin embargo, el resultado más
+relevante no es el rendimiento del modelo sino lo que revela sobre la estructura del
+problema: **`complain_1` concentra prácticamente toda la señal predictiva**, un
+hallazgo consistente en los 7 selectores evaluados y en cada criterio de importancia
+utilizado (Fisher J, MDA, Gain, $I(X;Y)$, $|\beta|$). Las 5 variables complementarias
+(`age`, `numofproducts`, `balance`, `isactivemember_1`, `creditscore`) aportan señal
+marginal pero real, capturable por el kernel RBF en dimensiones superiores.
+
+**Sobre accionabilidad:** la segmentación binaria resultante, 20.4% Crítico, 79.6%
+Bajo, habilita una intervención de retención de precisión quirúrgica. Un cliente
+que realiza una queja tiene probabilidad de churn cercana a 1; la ventana de
+intervención es estrecha y el costo de no actuar es alto. El framework TIC propuesto
+(llamada + oferta inmediata para segmento Crítico) es directamente implementable
+sobre el CRM con los scores generados por `new_prob`.
+
+**Sobre limitaciones y próximos pasos:** el dominio absoluto de `complain_1` plantea
+una pregunta operacional crítica: ¿la queja *predice* el churn o lo *precede* por
+horas? Si el registro de la queja y el abandono ocurren en la misma jornada, el
+modelo pierde utilidad predictiva real. Validar la secuencia temporal entre ambos
+eventos en datos de producción es el paso inmediato antes de cualquier despliegue.
+Adicionalmente, para evaluar el comportamiento del SVM en ausencia de `complain_1`,
+escenario plausible si la queja no está disponible en tiempo real, conviene
+reentrenar el modelo excluyendo esa variable y comparar el AUC resultante; la caída
+esperada revelará el peso real de las variables secundarias y la robustez operacional
+del sistema.
+
+---
+
+# Referencias 
+
+- **Vapnik, V. & Cortes, C.** (1995). Support-Vector Networks. *Machine Learning*, 20(3), 273–297.
+- **Hastie, T., Tibshirani, R. & Friedman, J.** (2009). *The Elements of Statistical Learning* (2nd ed.). Springer.
+- **Breiman, L.** (2001). Random Forests. *Machine Learning*, 45, 5–32.
+- **Friedman, J.** (2001). Greedy function approximation: a gradient boosting machine. *Annals of Statistics*, 29(5), 1189–1232.
+- **Meyer, D. et al.** (2023). e1071. R package. **Kuhn, M.** (2023). caret. R package.
+- **Kollipara, R.** (2023). *Bank Customer Churn* [Dataset]. Kaggle. <https://www.kaggle.com/datasets/radheshyamkollipara/bank-customer-churn>
+
+---
+
+*Quarto · R · tidyverse · ggplot2 · e1071 · caret · pROC · ROCR · randomForest · glmnet · xgboost · infotheo · igraph · kableExtra — Alejandro Figueroa Rojas*
